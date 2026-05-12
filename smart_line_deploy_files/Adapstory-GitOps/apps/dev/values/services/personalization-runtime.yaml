@@ -1,0 +1,163 @@
+# Personalization Runtime (BC-01) — Helm values for universal-service chart
+image:
+  repository: harbor.adapstory.com/adapstory/personalization-runtime
+  tag: 26.04.13-c95e2b076
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: harbor-registry
+
+replicas: 2
+
+remoteComputeScheduling:
+  enabled: true
+  preferredSites:
+    - home-laptop
+    - cloud
+  weight: 80
+
+terminationGracePeriodSeconds: 35
+
+service:
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+
+serviceLabels:
+  adapstory.com/openapi: "true"
+serviceAnnotations:
+  adapstory.com/openapi-name: "personalization-runtime"
+  adapstory.com/openapi-path: "/v3/api-docs"
+
+ingress:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+lifecycle:
+  preStop:
+    exec:
+      command: ["sleep", "5"]
+
+serviceMonitor:
+  enabled: true
+  path: /actuator/prometheus
+  interval: 30s
+
+prometheusRule:
+  enabled: true
+
+livenessProbe:
+  httpGet:
+    path: /actuator/health/liveness
+    port: 8081
+  initialDelaySeconds: 20
+  periodSeconds: 15
+  timeoutSeconds: 5
+
+readinessProbe:
+  httpGet:
+    path: /actuator/health/readiness
+    port: 8081
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+
+startupProbe:
+  httpGet:
+    path: /actuator/health/liveness
+    port: 8081
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 30
+
+extraEnv:
+  # ── JVM tuning: ZGC + tiny heap + virtual threads ──
+  - name: JAVA_TOOL_OPTIONS
+    value: "-XX:+UseZGC -XX:+ZGenerational -Xms128m -Xmx256m -Xss512k -XX:MaxMetaspaceSize=192m -XX:ReservedCodeCacheSize=48m -XX:MaxDirectMemorySize=32m -XX:ActiveProcessorCount=2 -XX:+ExitOnOutOfMemoryError"
+  - name: SPRING_THREADS_VIRTUAL_ENABLED
+    value: "true"
+  - name: SERVER_TOMCAT_THREADS_MAX
+    value: "50"
+  - name: SERVER_TOMCAT_THREADS_MIN_SPARE
+    value: "5"
+  - name: SPRING_PROFILES_ACTIVE
+    value: "dev"
+  - name: SERVER_PORT
+    value: "8081"
+  # Tomcat default 8KB too small — BFF enriches requests with JWT + X-headers (BUG fix 2026-03-29)
+  - name: SERVER_MAX_HTTP_REQUEST_HEADER_SIZE
+    value: "32KB"
+  # ── DataSource (BC-01 = adapstory_bc01, schema main) ──
+  - name: SPRING_DATASOURCE_URL
+    value: "jdbc:postgresql://dev-postgres-postgres-dev-svc.env-dev.svc.cluster.local:5432/adapstory_bc01?currentSchema=main"
+  - name: DB_USERNAME
+    value: "adapstory_dev_admin"
+  - name: DB_PASSWORD
+    value: "dev_adapstory2025"
+  # ── Redis ──
+  - name: REDIS_HOST
+    value: "redis-dev.env-dev.svc.cluster.local"
+  - name: REDIS_PORT
+    value: "6379"
+  # ── Kafka ──
+  - name: KAFKA_BOOTSTRAP_SERVERS
+    value: "dev-kafka-kafka0-headless.env-dev.svc.cluster.local:29092"
+  # ── OIDC JWT validation (SEC-AUTH-1) ──
+  - name: IDENTITY_AUDIENCE
+    value: "adapstory-bc01-service"
+  - name: OIDC_ISSUER
+    value: "https://auth.dev.adapstory.com/realms/adapstory"
+  - name: AUTHENTICATION_WEB_CLIENT_OIDC_SIGMA_HOST
+    value: "http://dev-keycloak-svc.env-dev.svc.cluster.local:8080/realms/adapstory"
+  - name: AUTHENTICATION_WEB_CLIENT_OIDC_SIGMA_PATH
+    value: "/protocol/openid-connect/certs"
+  # ── OTel service name ──
+  - name: OTEL_SERVICE_NAME
+    value: "personalization-runtime"
+  # OTLP Tracing
+  - name: ADAPSTORY_MONITORING_TRACING_ENABLED
+    value: "true"
+  - name: ADAPSTORY_MONITORING_TRACING_ENDPOINT
+    value: "http://dev-opentelemetry-collector.env-dev.svc.cluster.local:4317"
+  - name: ADAPSTORY_MONITORING_TRACING_PROTOCOL
+    value: "grpc"
+  # OTLP Metrics
+  - name: ADAPSTORY_MONITORING_OTLP_ENABLED
+    value: "true"
+  - name: ADAPSTORY_MONITORING_OTLP_ENDPOINT
+    value: "http://dev-opentelemetry-collector.env-dev.svc.cluster.local:4318/v1/metrics"
+  - name: ADAPSTORY_MONITORING_OTLP_STEP_SECONDS
+    value: "60"
+  # ── Logging levels ──
+  - name: LOGGING_LEVEL_ROOT
+    value: "INFO"
+  - name: ADAPSTORY_LOG_LEVEL
+    value: "TRACE"
+  - name: LOGGING_LEVEL_COM_ADAPSTORY
+    value: "TRACE"
+  - name: LOGGING_LEVEL_ORG_JOOQ
+    value: "DEBUG"
+  - name: LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_SECURITY
+    value: "DEBUG"
+  - name: LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_KAFKA
+    value: "DEBUG"
+  - name: LOGGING_LEVEL_IO_GITHUB_RESILIENCE4J
+    value: "DEBUG"

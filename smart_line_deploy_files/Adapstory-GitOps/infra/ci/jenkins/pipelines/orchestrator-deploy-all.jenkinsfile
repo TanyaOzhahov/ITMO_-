@@ -1,0 +1,760 @@
+// orchestrator-deploy-all.jenkinsfile
+// One-button orchestrator: builds & deploys ALL Adapstory services in correct dependency order.
+// Calls existing Jenkins jobs — no logic duplication.
+//
+// Jenkins job config:
+//   Type: Pipeline, SCM: adapstory-gitops.git
+//   Script Path: infra/ci/jenkins/pipelines/orchestrator-deploy-all.jenkinsfile
+//
+// Features:
+//   - Git-tracked multi-environment deploys: dev (default) or prod
+//   - Build modes: full (build+deploy), promote (deploy existing image tag), auto-promote (read tag from dev GitOps values)
+//   - Approval gate for prod deploys
+//   - Post-deploy health checks
+//   - Correct dependency order (foundation → core services → dev platform apps → frontend)
+//   - Skip checkboxes per service/app for partial reruns
+//   - Per-service build duration tracking → Pushgateway aggregate metric
+//   - No source-repo mutations (no auto-created release branches or tags)
+//
+// Build order:
+//   Phase 1 (Foundation):   master-pom → shared-libs                              [sequential, skip in promote mode]
+//   Phase 2 (Core):         Java platform services                                [sequential]
+//   Phase 3 (Dev-only):     AI/platform apps via app-build                          [sequential, dev full only]
+//   Phase 4 (Frontend):     frontend (student+admin+school+landing)               [sequential]
+//   Phase 5 (Keycloak):     custom build                                           [last, non-blocking]
+
+@Library('adapstory-ci-shared') _
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins/pipeline: orchestrator-deploy-all
+spec:
+  priorityClassName: ci-build
+  priority: 200000
+  preemptionPolicy: PreemptLowerPriority
+  containers:
+  - name: git
+    image: harbor.adapstory.com/adapstory/ci-git:1.0
+    command: ["sleep"]
+    args: ["infinity"]
+    resources:
+      requests: { cpu: "50m", memory: "64Mi" }
+      limits:   { cpu: "200m", memory: "256Mi" }
+'''
+        }
+    }
+
+    options {
+        disableConcurrentBuilds(abortPrevious: true)
+        timeout(time: 240, unit: 'MINUTES')
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        ansiColor('xterm')
+    }
+
+    parameters {
+        // ── Global ──
+        string(name: 'GIT_BRANCH', defaultValue: 'main', description: 'Branch for all services')
+        choice(name: 'DEPLOY_ENV', choices: ['dev', 'prod'], description: 'Target environment')
+        choice(name: 'BUILD_MODE', choices: ['full', 'promote', 'auto-promote'], description: 'full = build + deploy | promote = deploy PROMOTE_TAG | auto-promote = read current dev tag and deploy to prod')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip tests in all downstream jobs (hotfixes only!)')
+        string(name: 'PROMOTE_TAG', defaultValue: '', description: 'Image tag to promote (only for BUILD_MODE=promote, e.g. 26.03.29-abc123def)')
+        // ── Phase 1: Foundation (skip if no POM/libs changes) ──
+        booleanParam(name: 'BUILD_MASTER_POM',   defaultValue: true, description: 'Phase 1: Deploy master-pom to Nexus')
+        booleanParam(name: 'BUILD_SHARED_LIBS',  defaultValue: true, description: 'Phase 1: Deploy shared-libs to Nexus')
+
+        // ── Phase 2: Backend services ──
+        booleanParam(name: 'BUILD_IDENTITY',             defaultValue: true, description: 'Phase 2: adapstory-identity (BC-16)')
+        booleanParam(name: 'BUILD_DATA_MODEL_ENGINE',    defaultValue: true, description: 'Phase 2: adapstory-data-model-engine (BC-15)')
+        booleanParam(name: 'BUILD_MULTI_TENANT_RUNTIME', defaultValue: true, description: 'Phase 2: adapstory-multi-tenant-runtime (BC-19)')
+        booleanParam(name: 'BUILD_PLUGIN_LIFECYCLE',     defaultValue: true, description: 'Phase 2: adapstory-plugin-lifecycle (BC-02)')
+        booleanParam(name: 'BUILD_PLUGIN_GATEWAY',       defaultValue: true, description: 'Phase 2: adapstory-plugin-gateway')
+        booleanParam(name: 'BUILD_CONTENT_REPOSITORY',   defaultValue: true, description: 'Phase 2: adapstory-content-repository (BC-11)')
+        booleanParam(name: 'BUILD_PERSONALIZATION_RUNTIME', defaultValue: true, description: 'Phase 2: adapstory-personalization-runtime (BC-01)')
+        booleanParam(name: 'BUILD_BFF_SCHOOL',           defaultValue: true, description: 'Phase 2: adapstory-bff-school')
+        booleanParam(name: 'BUILD_BFF_ADMIN',            defaultValue: true, description: 'Phase 2: adapstory-bff-admin')
+        booleanParam(name: 'BUILD_BFF_STUDENT',          defaultValue: true, description: 'Phase 2: adapstory-bff-student')
+
+        // ── Phase 3: Dev-only platform apps ──
+        booleanParam(name: 'BUILD_AI_COURSE_GENERATOR', defaultValue: true, description: 'Phase 3: ai-course-generator (dev only)')
+        booleanParam(name: 'BUILD_DIFY_PLUGIN', defaultValue: true, description: 'Phase 3: dify-plugin (dev only)')
+        booleanParam(name: 'BUILD_EDU_KNOWLEDGE_GRAPH', defaultValue: true, description: 'Phase 3: edu-knowledge-graph (dev only)')
+        // ── Phase 4: Frontend & Keycloak ──
+        booleanParam(name: 'BUILD_FRONTEND_STUDENT', defaultValue: true, description: 'Phase 4: Frontend student app')
+        booleanParam(name: 'BUILD_FRONTEND_ADMIN',   defaultValue: true, description: 'Phase 4: Frontend admin app')
+        booleanParam(name: 'BUILD_FRONTEND_SCHOOL',  defaultValue: true, description: 'Phase 4: Frontend school app')
+        booleanParam(name: 'BUILD_LANDING',           defaultValue: true, description: 'Phase 4: Landing page')
+        booleanParam(name: 'BUILD_KEYCLOAK',          defaultValue: true, description: 'Phase 5: Keycloak (custom build)')
+    }
+
+    stages {
+
+        stage('Init') {
+            steps {
+                script {
+                    env.RESULTS = ''
+                    env.RESOLVED_TAG = ''
+
+                    // auto-promote: read tag from dev values, force prod + promote
+                    if (params.BUILD_MODE == 'auto-promote') {
+                        env.EFFECTIVE_ENV = 'prod'
+                        env.EFFECTIVE_MODE = 'promote'
+                    } else {
+                        env.EFFECTIVE_ENV = params.DEPLOY_ENV
+                        env.EFFECTIVE_MODE = params.BUILD_MODE
+                    }
+
+                    // Validate: promote mode requires a concrete image tag (auto-promote resolves it later)
+                    if (env.EFFECTIVE_MODE == 'promote' && params.BUILD_MODE != 'auto-promote'
+                            && !params.PROMOTE_TAG?.trim()) {
+                        error "BUILD_MODE=promote requires PROMOTE_TAG to be set"
+                    }
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════
+        // Auto-promote: read current dev tag from GitOps
+        // ════════════════════════════════════════════
+
+        stage('Resolve Dev Tag') {
+            when { expression { params.BUILD_MODE == 'auto-promote' } }
+            steps {
+                container('git') {
+                    withCredentials([
+                        usernamePassword(credentialsId: 'github-token',
+                            usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')
+                    ]) {
+                        script {
+                            sh """
+                                rm -rf /tmp/gitops-read && mkdir -p /tmp/gitops-read
+                                cd /tmp/gitops-read
+                                git clone --depth 1 -b main \
+                                    https://x-access-token:\${GH_TOKEN}@github.com/adapstory/Adapstory-GitOps.git . 2>/dev/null
+                            """
+
+                            // Read tag from a representative service (bff-admin)
+                            def devTag = sh(
+                                script: "grep 'tag:' /tmp/gitops-read/apps/dev/values/services/bff-admin.yaml | head -1 | sed 's/.*tag: *\"\\{0,1\\}//;s/\"\\{0,1\\}\$//'",
+                                returnStdout: true
+                            ).trim()
+
+                            if (!devTag || devTag == '0.0.1') {
+                                error "auto-promote: could not read dev tag from bff-admin.yaml (got: '${devTag}')"
+                            }
+
+                            env.RESOLVED_TAG = devTag
+                            echo "Auto-promote: resolved dev tag = ${devTag}"
+                        }
+                    }
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════
+        // Diff preview + build description
+        // ════════════════════════════════════════════
+
+        stage('Preview') {
+            steps {
+                script {
+                    def tag = resolveTag()
+                    def branch = resolveGitBranch()
+                    def envLabel = env.EFFECTIVE_ENV.toUpperCase()
+                    def modeLabel = (env.EFFECTIVE_MODE == 'promote') ? "promote:${tag}" : 'full'
+                    currentBuild.description = "${envLabel} | ${modeLabel} | Branch: ${branch}"
+                    echo "═══ Deploy Preview ═══"
+                    echo "Environment: ${envLabel}"
+                    echo "Mode:        ${modeLabel}"
+                    echo "Skip Tests:  ${params.SKIP_TESTS}"
+                    echo "Tag:         ${tag ?: '(will be computed per service)'}"
+                    echo "Branch:      ${branch}"
+                    echo "GitOps:      source repos are read-only during deploy; only GitOps values are updated"
+                    echo "═════════════════════"
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════
+        // Approval gate for prod
+        // ════════════════════════════════════════════
+
+        stage('Approve Prod Deploy') {
+            when { expression { env.EFFECTIVE_ENV == 'prod' } }
+            steps {
+                script {
+                    def tag = resolveTag()
+                    input message: "Deploy to PROD with tag ${tag}?",
+                          ok: 'Deploy to PROD',
+                          submitter: 'admin'
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════
+        // Phase 1: Foundation artifacts (Nexus deploy)
+        // Skipped in promote mode — artifacts already in Nexus
+        // ════════════════════════════════════════════
+
+        stage('Phase 1: Foundation') {
+            when { expression { env.EFFECTIVE_MODE == 'full' } }
+            stages {
+
+                stage('master-pom') {
+                    when { expression { params.BUILD_MASTER_POM } }
+                    steps {
+                        script {
+                            // Call the GitOps-managed job name, not the legacy API-created alias.
+                            callJob('master-pom-deploy', [
+                                string(name: 'GIT_BRANCH', value: resolveGitBranch())
+                            ])
+                        }
+                    }
+                }
+
+                stage('shared-libs') {
+                    when { expression { params.BUILD_SHARED_LIBS } }
+                    steps {
+                        script {
+                            def libParams = [
+                                string(name: 'GIT_BRANCH', value: resolveGitBranch())
+                            ]
+                            if (params.SKIP_TESTS) {
+                                libParams << booleanParam(name: 'SKIP_TESTS', value: true)
+                            }
+                            // Call the GitOps-managed job name, not the legacy API-created alias.
+                            callJob('shared-libs-deploy', libParams)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════
+        // Phase 2: All services sequential
+        // ════════════════════════════════════════════
+
+        stage('Phase 2: Backend Services') {
+            stages {
+
+                stage('identity') {
+                    when { expression { params.BUILD_IDENTITY } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callDeploy('adapstory-identity') }
+                    } }
+                }
+
+                stage('data-model-engine') {
+                    when { expression { params.BUILD_DATA_MODEL_ENGINE } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callDeploy('adapstory-data-model-engine') }
+                    } }
+                }
+
+                stage('multi-tenant-runtime') {
+                    when { expression { params.BUILD_MULTI_TENANT_RUNTIME } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callDeploy('adapstory-multi-tenant-runtime') }
+                    } }
+                }
+
+                stage('plugin-lifecycle') {
+                    when { expression { params.BUILD_PLUGIN_LIFECYCLE } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callDeploy('adapstory-plugin-lifecycle') }
+                    } }
+                }
+
+                stage('plugin-gateway') {
+                    when { expression { params.BUILD_PLUGIN_GATEWAY } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callDeploy('adapstory-plugin-gateway') }
+                    } }
+                }
+
+                stage('content-repository') {
+                    when { expression { params.BUILD_CONTENT_REPOSITORY } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callDeploy('adapstory-content-repository') }
+                    } }
+                }
+
+                stage('personalization-runtime') {
+                    when { expression { params.BUILD_PERSONALIZATION_RUNTIME } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callDeploy('adapstory-personalization-runtime') }
+                    } }
+                }
+
+                stage('bff-admin') {
+                    when { expression { params.BUILD_BFF_ADMIN } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callDeploy('adapstory-bff-admin') }
+                    } }
+                }
+
+                stage('bff-school') {
+                    when { expression { params.BUILD_BFF_SCHOOL } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callDeploy('adapstory-bff-school') }
+                    } }
+                }
+
+                stage('bff-student') {
+                    when { expression { params.BUILD_BFF_STUDENT } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callDeploy('adapstory-bff-student') }
+                    } }
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════
+        // Phase 3: Dev-only platform apps
+        // ════════════════════════════════════════════
+
+        stage('Phase 3: Dev Platform Apps') {
+            when { expression { env.EFFECTIVE_ENV == 'dev' && env.EFFECTIVE_MODE == 'full' } }
+            stages {
+
+                stage('ai-course-generator') {
+                    when { expression { params.BUILD_AI_COURSE_GENERATOR } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callAppBuild('ai-course-generator') }
+                    } }
+                }
+
+                stage('dify-plugin') {
+                    when { expression { params.BUILD_DIFY_PLUGIN } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callAppBuild('dify-plugin') }
+                    } }
+                }
+
+                stage('edu-knowledge-graph') {
+                    when { expression { params.BUILD_EDU_KNOWLEDGE_GRAPH } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script { callAppBuild('edu-knowledge-graph') }
+                    } }
+                }
+
+            }
+        }
+
+        // ════════════════════════════════════════════
+        // Phase 4: Frontend
+        // ════════════════════════════════════════════
+
+        stage('Phase 4: Frontend') {
+            stages {
+
+                stage('frontend-student') {
+                    when { expression { params.BUILD_FRONTEND_STUDENT } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script {
+                            callJob('frontend-build', [
+                                string(name: 'APP_NAME', value: 'student'),
+                                string(name: 'GIT_BRANCH', value: resolveGitBranch()),
+                                string(name: 'DEPLOY_ENV', value: env.EFFECTIVE_ENV)
+                            ])
+                        }
+                    } }
+                }
+
+                stage('frontend-admin') {
+                    when { expression { params.BUILD_FRONTEND_ADMIN } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script {
+                            callJob('frontend-build', [
+                                string(name: 'APP_NAME', value: 'admin'),
+                                string(name: 'GIT_BRANCH', value: resolveGitBranch()),
+                                string(name: 'DEPLOY_ENV', value: env.EFFECTIVE_ENV)
+                            ])
+                        }
+                    } }
+                }
+
+                stage('frontend-school') {
+                    when { expression { params.BUILD_FRONTEND_SCHOOL } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script {
+                            callJob('frontend-build', [
+                                string(name: 'APP_NAME', value: 'school'),
+                                string(name: 'GIT_BRANCH', value: resolveGitBranch()),
+                                string(name: 'DEPLOY_ENV', value: env.EFFECTIVE_ENV)
+                            ])
+                        }
+                    } }
+                }
+
+                stage('landing') {
+                    when { expression { params.BUILD_LANDING } }
+                    steps { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script {
+                            callJob('landing-build', [
+                                string(name: 'GIT_BRANCH', value: resolveGitBranch()),
+                                string(name: 'DEPLOY_ENV', value: env.EFFECTIVE_ENV)
+                            ])
+                        }
+                    } }
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════
+        // Phase 5: Keycloak (skip in promote mode)
+        // ════════════════════════════════════════════
+
+        stage('Phase 5: Keycloak') {
+            when { expression { params.BUILD_KEYCLOAK && env.EFFECTIVE_MODE == 'full' } }
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                    script {
+                        callJob('keycloak-build', [
+                            string(name: 'GIT_BRANCH', value: resolveGitBranch())
+                        ])
+                    }
+                }
+            }
+        }
+
+        // ════════════════════════════════════════════
+        // Phase 5: Post-deploy health check
+        // ════════════════════════════════════════════
+
+        stage('Health Check') {
+            steps {
+                container('git') {
+                    catchError(buildResult: currentBuild.currentResult, stageResult: 'UNSTABLE', catchInterruptions: false) {
+                        script {
+                            def ns = (env.EFFECTIVE_ENV == 'prod') ? 'env-prod' : 'env-dev'
+                            def prefix = (env.EFFECTIVE_ENV == 'prod') ? 'prod' : 'dev'
+
+                            // Service → DNS:port + path (matches Helm release names + readiness endpoints)
+                            def serviceChecks = [
+                                'adapstory-identity':              [url: "${prefix}-identity-service-svc.${ns}.svc:8082", path: '/actuator/health/readiness'],
+                                'adapstory-bff-admin':             [url: "${prefix}-bff-admin-svc.${ns}.svc:8080", path: '/actuator/health/readiness'],
+                                'adapstory-bff-school':            [url: "${prefix}-bff-school-svc.${ns}.svc:8085", path: '/actuator/health/readiness'],
+                                'adapstory-bff-student':           [url: "${prefix}-bff-student-svc.${ns}.svc:8080", path: '/actuator/health/readiness'],
+                                'adapstory-data-model-engine':     [url: "${prefix}-data-model-engine-svc.${ns}.svc:8081", path: '/actuator/health/readiness'],
+                                'adapstory-multi-tenant-runtime':  [url: "${prefix}-multi-tenant-runtime-svc.${ns}.svc:8080", path: '/actuator/health/readiness'],
+                                'adapstory-plugin-lifecycle':      [url: "${prefix}-plugin-lifecycle-svc.${ns}.svc:8083", path: '/actuator/health/readiness'],
+                                'adapstory-plugin-gateway':        [url: "${prefix}-plugin-gateway-svc.${ns}.svc:8090", path: '/actuator/health/readiness'],
+                                'adapstory-content-repository':    [url: "${prefix}-content-repository-svc.${ns}.svc:8087", path: '/actuator/health/readiness'],
+                                'adapstory-personalization-runtime': [url: "${prefix}-personalization-runtime-svc.${ns}.svc:8081", path: '/actuator/health/readiness'],
+                                'ai-course-generator':             [url: "${prefix}-ai-course-generator-svc.${ns}.svc:8000", path: '/actuator/health/readiness'],
+                                'dify-plugin':                     [url: "${prefix}-dify-plugin-svc.${ns}.svc:8000", path: '/actuator/health/readiness'],
+                                'edu-knowledge-graph':             [url: "${prefix}-edu-knowledge-graph-svc.${ns}.svc:8080", path: '/actuator/health/readiness'],
+                            ]
+
+                            def services = collectEnabledServices()
+                            def healthy = 0
+                            def unhealthy = 0
+                            def maxRetries = 3
+                            def retryDelaySeconds = 20
+
+                            // Warmup: let K8s finish rolling deployments before checking
+                            echo "Waiting 60s for services to settle after deploy..."
+                            sleep 60
+
+                            echo "Running health checks for ${services.size()} services in ${ns} (up to ${maxRetries} attempts per service)..."
+
+                            for (svc in services) {
+                                def check = serviceChecks[svc]
+                                if (!check) {
+                                    echo "  ${svc}: no HTTP health mapping, skipped"
+                                    continue
+                                }
+                                def status = 'DOWN'
+                                for (int attempt = 1; attempt <= maxRetries; attempt++) {
+                                    status = sh(
+                                        script: """
+                                            code=\$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 http://${check.url}${check.path} || true)
+                                            case "\$code" in
+                                              2*|3*) echo UP ;;
+                                              *) echo DOWN ;;
+                                            esac
+                                        """,
+                                        returnStdout: true
+                                    ).trim()
+                                    if (status == 'UP') break
+                                    if (attempt < maxRetries) {
+                                        echo "  ${svc}: attempt ${attempt}/${maxRetries} = DOWN, retrying in ${retryDelaySeconds}s..."
+                                        sleep retryDelaySeconds
+                                    }
+                                }
+                                if (status == 'UP') {
+                                    echo "  ✓ ${svc}: UP"
+                                    healthy++
+                                } else {
+                                    echo "  ✗ ${svc}: DOWN (after ${maxRetries} attempts)"
+                                    unhealthy++
+                                }
+                            }
+
+                            echo "Health: ${healthy} UP, ${unhealthy} DOWN out of ${services.size()}"
+                            if (unhealthy > 0) {
+                                unstable "${unhealthy} services failed health check"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+    }
+
+    post {
+        always {
+            script {
+                def summary = buildSummary()
+                def status = currentBuild.currentResult ?: 'UNKNOWN'
+                def totalDurationSec = ((currentBuild.duration ?: 0) / 1000).intValue()
+                def totalMin = totalDurationSec.intdiv(60)
+                def totalSec = totalDurationSec % 60
+                def envLabel = env.EFFECTIVE_ENV.toUpperCase()
+                def tag = resolveTag()
+
+                currentBuild.description = "${envLabel} | ${status} | Branch: ${params.GIT_BRANCH} | ${totalMin}m${totalSec}s\n${summary}"
+
+                // ── Push orchestrator metrics to Pushgateway ──
+                container('git') {
+                    catchError(buildResult: currentBuild.currentResult, stageResult: 'UNSTABLE', catchInterruptions: false) {
+                        pushOrchestratorMetrics()
+                    }
+                }
+
+                // ── Telegram notification ──
+                container('git') {
+                    catchError(buildResult: currentBuild.currentResult, stageResult: 'UNSTABLE', catchInterruptions: false) {
+                        def modeLabel = (env.EFFECTIVE_MODE == 'promote') ? "promote:${tag}" : 'full'
+                        def tgText = buildMetrics.formatOrchestratorReport(
+                            status: status,
+                            duration: totalDurationSec,
+                            branch: params.GIT_BRANCH,
+                            buildUrl: env.BUILD_URL,
+                            buildNumber: env.BUILD_NUMBER,
+                            summary: summary,
+                            extra: "${envLabel} | ${modeLabel}"
+                        )
+
+                        withCredentials([
+                            string(credentialsId: 'telegram-bot-token', variable: 'TG_TOKEN'),
+                            string(credentialsId: 'telegram-chat-id', variable: 'TG_CHAT')
+                        ]) {
+                            withEnv(["TG_TEXT=${tgText}"]) {
+                                sh '''
+                                    curl -s --connect-timeout 10 --max-time 30 \
+                                        -X POST "http://telegram-bot-api.backup.svc.cluster.local:8081/bot$TG_TOKEN/sendMessage" \
+                                        -d chat_id="$TG_CHAT" \
+                                        -d parse_mode="Markdown" \
+                                        -d text="$TG_TEXT" || true
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+            cleanWs()
+        }
+    }
+}
+
+// ════════════════════════════════════════════
+// Helper methods
+// ════════════════════════════════════════════
+
+/**
+ * Resolves the effective image tag based on build mode.
+ */
+String resolveTag() {
+    if (env.RESOLVED_TAG?.trim()) return env.RESOLVED_TAG
+    if (params.PROMOTE_TAG?.trim()) return params.PROMOTE_TAG
+    return ''
+}
+
+/**
+ * Resolves the effective git branch for downstream jobs.
+ */
+String resolveGitBranch() {
+    return params.GIT_BRANCH
+}
+
+/**
+ * Calls deploy job with environment-aware parameters.
+ */
+def callDeploy(String serviceName) {
+    def tag = resolveTag()
+    def jobParams = [
+        string(name: 'SERVICE', value: serviceName),
+        string(name: 'GIT_BRANCH', value: resolveGitBranch()),
+        string(name: 'DEPLOY_ENV', value: env.EFFECTIVE_ENV)
+    ]
+    if (params.SKIP_TESTS) {
+        jobParams << booleanParam(name: 'SKIP_TESTS', value: true)
+    }
+    if (env.EFFECTIVE_MODE == 'promote' && tag) {
+        jobParams << string(name: 'TAG', value: tag)
+        jobParams << booleanParam(name: 'SKIP_BUILD', value: true)
+    }
+    callJob('deploy-dev-v3', jobParams)
+}
+
+def callAppBuild(String appName) {
+    callJob('app-build', [
+        string(name: 'APP', value: appName),
+        string(name: 'GIT_BRANCH', value: resolveGitBranch())
+    ])
+}
+
+/**
+ * Collects list of enabled services from build parameters.
+ */
+List<String> collectEnabledServices() {
+    def services = []
+    if (params.BUILD_IDENTITY)             services << 'adapstory-identity'
+    if (params.BUILD_DATA_MODEL_ENGINE)    services << 'adapstory-data-model-engine'
+    if (params.BUILD_MULTI_TENANT_RUNTIME) services << 'adapstory-multi-tenant-runtime'
+    if (params.BUILD_PLUGIN_LIFECYCLE)     services << 'adapstory-plugin-lifecycle'
+    if (params.BUILD_PLUGIN_GATEWAY)       services << 'adapstory-plugin-gateway'
+    if (params.BUILD_CONTENT_REPOSITORY)   services << 'adapstory-content-repository'
+    if (params.BUILD_PERSONALIZATION_RUNTIME) services << 'adapstory-personalization-runtime'
+    if (params.BUILD_BFF_ADMIN)            services << 'adapstory-bff-admin'
+    if (params.BUILD_BFF_SCHOOL)           services << 'adapstory-bff-school'
+    if (params.BUILD_BFF_STUDENT)          services << 'adapstory-bff-student'
+    if (env.EFFECTIVE_ENV == 'dev' && env.EFFECTIVE_MODE == 'full') {
+        if (params.BUILD_AI_COURSE_GENERATOR) services << 'ai-course-generator'
+        if (params.BUILD_DIFY_PLUGIN)         services << 'dify-plugin'
+        if (params.BUILD_EDU_KNOWLEDGE_GRAPH) services << 'edu-knowledge-graph'
+    }
+    return services
+}
+
+/**
+ * Generic job caller with result tracking and retry on pod scheduling failures.
+ * Retries once after 60s if first attempt fails quickly (<60s) — indicates pod scheduling issue.
+ */
+def callJob(String jobName, List jobParams) {
+    def stageName = env.STAGE_NAME
+    def startMs = System.currentTimeMillis()
+    def maxAttempts = 2
+    def lastException = null
+
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            def attemptStart = System.currentTimeMillis()
+            def result = build(
+                job: jobName,
+                parameters: jobParams,
+                wait: true,
+                propagate: false
+            )
+            def buildResult = result.result
+            def durationSec = ((System.currentTimeMillis() - startMs) / 1000).intValue()
+            env.RESULTS = (env.RESULTS ?: '') + "${stageName}=${buildResult},"
+            env.DURATIONS = (env.DURATIONS ?: '') + "${stageName}=${durationSec},"
+
+            if (buildResult == 'FAILURE') {
+                def attemptDuration = ((System.currentTimeMillis() - attemptStart) / 1000).intValue()
+                // Quick failure (<60s) on first attempt = likely pod scheduling; retry
+                if (attempt < maxAttempts && attemptDuration < 60) {
+                    echo "WARNING: ${jobName} failed in ${attemptDuration}s (likely pod scheduling). Waiting 60s before retry..."
+                    sleep(60)
+                    // Reset tracking for retry
+                    env.RESULTS = (env.RESULTS ?: '').replace("${stageName}=${buildResult},", '')
+                    env.DURATIONS = (env.DURATIONS ?: '').replace("${stageName}=${durationSec},", '')
+                    continue
+                }
+                error "${jobName} FAILED (build #${result.number}, ${durationSec}s). Check: ${result.absoluteUrl}"
+            } else if (buildResult == 'ABORTED') {
+                // Jenkins Script Security blocks classloader-based reflection here.
+                // Throwing via error() preserves the retry path without manual approvals.
+                error "${jobName} ABORTED (build #${result.number}, ${durationSec}s). Check: ${result.absoluteUrl}"
+            } else if (buildResult == 'UNSTABLE') {
+                unstable "${jobName} is UNSTABLE (build #${result.number}, ${durationSec}s)"
+            }
+            echo "${stageName}: ${buildResult} (${durationSec}s) → ${result.absoluteUrl}"
+            return // success, exit loop
+        } catch (Exception e) {
+            lastException = e
+            def durationSec = ((System.currentTimeMillis() - startMs) / 1000).intValue()
+            if (attempt >= maxAttempts) {
+                env.RESULTS = (env.RESULTS ?: '') + "${stageName}=FAILED,"
+                env.DURATIONS = (env.DURATIONS ?: '') + "${stageName}=${durationSec},"
+                throw e
+            }
+            echo "WARNING: ${jobName} threw exception on attempt ${attempt}: ${e.message}. Waiting 60s before retry..."
+            sleep(60)
+        }
+    }
+}
+
+/**
+ * Builds a Telegram-friendly summary from tracked results with durations.
+ */
+def buildSummary() {
+    def results = env.RESULTS ?: ''
+    def durations = env.DURATIONS ?: ''
+    if (!results) return 'No services were built'
+
+    def durationMap = [:]
+    durations.split(',').findAll { it }.each { entry ->
+        def parts = entry.split('=')
+        if (parts.size() == 2) durationMap[parts[0]] = parts[1]
+    }
+
+    def lines = results.split(',').findAll { it }.collect { entry ->
+        def parts = entry.split('=')
+        def name = parts[0]
+        def status = parts.size() > 1 ? parts[1] : 'UNKNOWN'
+        def icon = (status == 'SUCCESS') ? '✅' : (status == 'UNSTABLE') ? '⚠️' : '❌'
+        def dur = durationMap[name]
+        def durStr = dur ? " (${((dur as int).intdiv(60))}m${((dur as int) % 60)}s)" : ''
+        "${icon} ${name}${durStr}"
+    }
+    return lines.join('%0A')
+}
+
+/**
+ * Push orchestrator-level aggregate metrics to Pushgateway.
+ */
+def pushOrchestratorMetrics() {
+    def pushgateway = 'http://pushgateway-prometheus-pushgateway.monitoring.svc:9091'
+    def totalDuration = ((currentBuild.duration ?: 0) / 1000).intValue()
+    def result = currentBuild.currentResult ?: 'UNKNOWN'
+    def branch = params.GIT_BRANCH ?: 'main'
+    def deployEnv = env.EFFECTIVE_ENV ?: 'dev'
+    def labels = "branch=\"${branch}\",build=\"${env.BUILD_NUMBER}\",result=\"${result}\",env=\"${deployEnv}\""
+
+    def sb = new StringBuilder()
+    sb.append("# HELP adapstory_orchestrator_duration_seconds Total orchestrator pipeline duration\n")
+    sb.append("# TYPE adapstory_orchestrator_duration_seconds gauge\n")
+    sb.append("adapstory_orchestrator_duration_seconds{${labels}} ${totalDuration}\n")
+    sb.append("# HELP adapstory_orchestrator_success Whether full deploy succeeded\n")
+    sb.append("# TYPE adapstory_orchestrator_success gauge\n")
+    sb.append("adapstory_orchestrator_success{${labels}} ${result == 'SUCCESS' ? 1 : 0}\n")
+
+    def durations = env.DURATIONS ?: ''
+    durations.split(',').findAll { it }.each { entry ->
+        def parts = entry.split('=')
+        if (parts.size() == 2) {
+            def svc = parts[0].replaceAll('[^a-zA-Z0-9_]', '_')
+            sb.append("adapstory_orchestrator_service_seconds{${labels},service=\"${svc}\"} ${parts[1]}\n")
+        }
+    }
+
+    writeFile file: 'orchestrator-metrics.prom', text: sb.toString()
+    sh """
+        curl -sf --connect-timeout 5 --max-time 15 \
+            --data-binary @orchestrator-metrics.prom \
+            '${pushgateway}/metrics/job/orchestrator/build/${env.BUILD_NUMBER}' \
+        && echo "Orchestrator metrics pushed" \
+        || echo "WARNING: Pushgateway push failed (non-blocking)"
+    """
+}

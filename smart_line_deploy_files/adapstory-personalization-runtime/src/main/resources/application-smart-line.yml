@@ -1,0 +1,83 @@
+# Smart Line Widget Lake Configuration
+# Add to adapstory-personalization-runtime/src/main/resources/application.yml
+
+adapstory:
+  smart-line:
+    enabled: true
+    ttl-seconds: 1800  # Redis StudentState TTL (sliding window)
+    widget-ttl-seconds: 300  # Widget instance TTL
+
+  llm-gateway:
+    url: http://adapstory-plugin-gateway:8080
+    timeout-ms: 5000
+    circuit-breaker:
+      failure-threshold: 5
+      delay-ms: 60000
+
+spring:
+  # Redis configuration for StudentState caching
+  redis:
+    host: localhost
+    port: 6379
+    timeout: 5000ms
+    lettuce:
+      pool:
+        max-active: 20
+        max-idle: 10
+        min-idle: 5
+
+  # Kafka configuration for event publishing
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all  # Wait for all replicas
+      retries: 3
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        linger.ms: 100
+        batch.size: 32768
+    consumer:
+      bootstrap-servers: localhost:9092
+      group-id: personalization-runtime-smart-line
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.adapstory"
+
+  # Jackson configuration for DivKit JSON rendering
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+      indent-output: true
+    deserialization:
+      fail-on-unknown-properties: false
+
+# Logging configuration for debugging
+logging:
+  level:
+    com.adapstory.personalization: DEBUG
+    org.springframework.kafka: INFO
+    org.springframework.data.redis: DEBUG
+
+# Kafka topics configuration
+kafka:
+  topics:
+    smart-line:
+      widget-rendered:
+        name: smart-line.widget.rendered
+        partitions: 3
+        replication-factor: 2
+      student-answered:
+        name: smart-line.student.answered
+        partitions: 3
+        replication-factor: 2
+      student-mastered:
+        name: smart-line.student.mastered
+        partitions: 1
+        replication-factor: 2
+      session-terminated:
+        name: smart-line.session.terminated
+        partitions: 2
+        replication-factor: 2

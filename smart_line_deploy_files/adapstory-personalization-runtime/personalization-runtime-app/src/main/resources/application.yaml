@@ -1,0 +1,93 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: personalization-runtime
+  datasource:
+    url: jdbc:postgresql://localhost:5432/adapstory_bc01
+    username: ${DB_USERNAME:adapstory}
+    password: ${DB_PASSWORD:adapstory}
+    hikari:
+      maximum-pool-size: 10
+      connection-init-sql: SET search_path TO main
+  liquibase:
+    change-log: classpath:db/changelog/changelog-master.xml
+    default-schema: main
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
+
+adapstory:
+  data:
+    audit:
+      enabled: true
+      table-columns:
+        bc01_widget:
+          created-at-column: widget_created_at
+          updated-at-column: widget_updated_at
+          created-by-column: widget_created_by
+          updated-by-column: widget_updated_by
+        bc01_page:
+          created-at-column: page_created_at
+          updated-at-column: page_updated_at
+          created-by-column: page_created_by
+          updated-by-column: page_updated_by
+        bc01_block:
+          created-at-column: block_created_at
+          updated-at-column: block_updated_at
+          created-by-column: block_created_by
+          updated-by-column: block_updated_by
+        bc01_plugin_widget:
+          created-at-column: pw_created_at
+          updated-at-column: pw_updated_at
+          created-by-column: pw_created_by
+          updated-by-column: pw_updated_by
+        bc01_pattern_template:
+          created-at-column: template_created_at
+          updated-at-column: template_updated_at
+          created-by-column: template_created_by
+          updated-by-column: template_updated_by
+    soft-delete:
+      enabled: true
+      table-columns:
+        bc01_widget: widget_deleted_at
+        bc01_page: page_deleted_at
+        bc01_block: block_deleted_at
+        bc01_plugin_widget: pw_deleted_at
+        bc01_pattern_template: template_deleted_at
+
+authentication:
+  enable: true
+  authenticate-paths: /api/bc-01/personalization/**
+  not-authenticate-paths: /actuator/**,/swagger-ui/**,/v3/api-docs/**
+  web-client-oidc:
+    audiences:
+      - "${IDENTITY_AUDIENCE:adapstory-bc01-service}"
+      - "adapstory-bff-admin"
+      - "adapstory-bff-student"
+      - "adapstory-api"
+    issuers:
+      - "${OIDC_ISSUER:https://keycloak.adapstory.com/realms/adapstory}"
+    sigma:
+      host: "${AUTHENTICATION_WEB_CLIENT_OIDC_SIGMA_HOST:http://keycloak:8080/realms/adapstory}"
+      path: "${AUTHENTICATION_WEB_CLIENT_OIDC_SIGMA_PATH:/protocol/openid-connect/certs}"

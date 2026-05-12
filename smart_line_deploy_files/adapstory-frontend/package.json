@@ -1,0 +1,64 @@
+{
+  "name": "adapstory-frontend",
+  "private": true,
+  "packageManager": "pnpm@10.32.1",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "format": "turbo run format",
+    "format:check": "turbo run format:check",
+    "test:e2e": "playwright test",
+    "test:e2e:admin": "playwright test --project=admin",
+    "test:e2e:student": "playwright test --project=student",
+    "test:e2e:landing": "playwright test --project=landing",
+    "test:e2e:ui": "playwright test --ui",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.11.1",
+    "@commitlint/cli": "^19.8.1",
+    "@commitlint/config-conventional": "^19.8.1",
+    "@playwright/test": "^1.58.2",
+    "@rolldown/binding-darwin-arm64": "1.0.0-rc.9",
+    "eslint": "^9",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.5.2",
+    "prettier": "^3.8.1",
+    "turbo": "^2.5.4"
+  },
+  "lint-staged": {
+    "packages/**/!(generated)/**/*.{ts,tsx,mts}": [
+      "eslint --max-warnings 0 --no-warn-ignored",
+      "prettier --write --ignore-unknown"
+    ],
+    "packages/**/*.{json,css,md}": [
+      "prettier --write --ignore-unknown"
+    ]
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@parcel/watcher",
+      "@swc/core",
+      "msw",
+      "protobufjs"
+    ],
+    "overrides": {
+      "@eslint/config-array": ">=0.23.0",
+      "flatted": ">=3.4.2",
+      "yaml": ">=2.8.3",
+      "picomatch": ">=4.0.4",
+      "lodash": ">=4.18.0",
+      "defu": ">=6.1.5",
+      "hono": ">=4.12.12",
+      "@hono/node-server": ">=1.19.13",
+      "vite": ">=8.0.5",
+      "path-to-regexp": ">=6.3.0 <7.0.0"
+    },
+    "ignoredBuiltDependencies": [
+      "sharp",
+      "unrs-resolver"
+    ]
+  }
+}

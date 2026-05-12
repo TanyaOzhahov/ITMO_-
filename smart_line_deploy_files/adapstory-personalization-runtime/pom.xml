@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.adapstory</groupId>
+        <artifactId>adapstory-master-pom</artifactId>
+        <version>2026.04.1-SNAPSHOT</version>
+        <relativePath/>
+    </parent>
+
+    <artifactId>adapstory-personalization-runtime</artifactId>
+    <version>2026.04.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>Adapstory Personalization Runtime</name>
+    <description>Bounded Context: Personalization Runtime (BC-01) — Widget Lake, SDUI rendering, hyper-personalization engine.</description>
+
+    <modules>
+        <module>personalization-runtime-app</module>
+        <module>personalization-runtime-application</module>
+        <module>personalization-runtime-client</module>
+        <module>personalization-runtime-domain</module>
+        <module>personalization-runtime-infrastructure</module>
+        <module>personalization-runtime-presentation</module>
+    </modules>
+
+    <distributionManagement>
+        <repository>
+            <id>nexus-releases</id>
+            <name>Nexus Releases</name>
+            <url>https://nexus.adapstory.com/repository/maven-releases/</url>
+        </repository>
+        <snapshotRepository>
+            <id>nexus-snapshots</id>
+            <name>Nexus Snapshots</name>
+            <url>https://nexus.adapstory.com/repository/maven-snapshots/</url>
+        </snapshotRepository>
+    </distributionManagement>
+
+    <repositories>
+        <repository>
+            <snapshots>
+                <enabled>true</enabled>
+            </snapshots>
+            <id>nexus-public</id>
+            <name>Nexus Public (primary)</name>
+            <url>https://nexus.adapstory.com/repository/maven-public/</url>
+        </repository>
+        <repository>
+            <snapshots>
+                <enabled>true</enabled>
+            </snapshots>
+            <id>github</id>
+            <name>GitHub Packages (fallback)</name>
+            <url>https://maven.pkg.github.com/adapstory/*</url>
+        </repository>
+    </repositories>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>com.diffplug.spotless</groupId>
+                <artifactId>spotless-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>com.github.spotbugs</groupId>
+                <artifactId>spotbugs-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-checkstyle-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-javadoc-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-pmd-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-source-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.owasp</groupId>
+                <artifactId>dependency-check-maven</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

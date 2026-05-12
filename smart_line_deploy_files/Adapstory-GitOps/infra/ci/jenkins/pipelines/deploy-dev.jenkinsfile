@@ -1,0 +1,924 @@
+// deploy-dev.jenkinsfile
+// Unified deploy pipeline for Java microservices to dev environment.
+// Builds from source (Maven 3-phase), pushes to Harbor, updates GitOps → ArgoCD syncs.
+//
+// Jenkins job config:
+//   Type: Pipeline, SCM: adapstory-gitops.git
+//   Script Path: infra/ci/jenkins/pipelines/deploy-dev.jenkinsfile
+//
+// Supported services: bff-admin, bff-student, identity, data-model-engine, multi-tenant-runtime, plugin-lifecycle
+//
+// Performance optimizations:
+//   - PVC-backed Maven cache on NVMe SSD (survives between builds)
+//   - Parallel Maven builds (-T 1C)
+//   - Maven daemon (mvnd-like via -T)
+//   - Kaniko layer caching
+//   - Non-recursive root POM installs to prevent cached-failure resolution errors
+//
+// Build metrics:
+//   - maven-buildtime-profiler (.mvn/extensions.xml in each repo)
+//   - GC logging via MAVEN_OPTS (-Xlog:gc*)
+//   - Metrics pushed to Prometheus Pushgateway after each build
+//   - Grafana dashboard: "CI/CD Build Performance"
+
+@Library('adapstory-ci-shared') _
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins/pipeline: deploy-dev
+spec:
+  priorityClassName: ci-build
+  priority: 200000
+  preemptionPolicy: PreemptLowerPriority
+  containers:
+  - name: maven
+    image: maven:3.9-eclipse-temurin-25
+    command: ["sleep"]
+    args: ["infinity"]
+    resources:
+      requests: { cpu: "100m", memory: "256Mi" }
+      limits:   { cpu: "2", memory: "4Gi" }
+    env:
+    - name: DOCKER_HOST
+      value: "unix:///var/run/docker-shared/docker.sock"
+    - name: TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE
+      value: "/var/run/docker-shared/docker.sock"
+    - name: TESTCONTAINERS_RYUK_DISABLED
+      value: "true"
+    - name: HTTPS_PROXY
+      value: "http://forward-proxy.forward-proxy.svc:3128"
+    - name: HTTP_PROXY
+      value: "http://forward-proxy.forward-proxy.svc:3128"
+    - name: NO_PROXY
+      value: "localhost,127.0.0.1,harbor.adapstory.com,10.0.0.0/8,192.168.0.0/16,.svc,.cluster.local"
+    - name: MAVEN_OPTS
+      value: >-
+        -XX:MaxRAMPercentage=75.0
+        -Xlog:gc*:file=/tmp/build-gc.log:time,level,tags,uptime
+    - name: OTEL_EXPORTER_OTLP_ENDPOINT
+      value: "http://otel-collector-opentelemetry-collector.monitoring.svc.cluster.local:4317"
+    - name: OTEL_TRACES_EXPORTER
+      value: "otlp"
+    - name: OTEL_METRICS_EXPORTER
+      value: "none"
+    - name: OTEL_LOGS_EXPORTER
+      value: "none"
+    - name: OTEL_RESOURCE_ATTRIBUTES
+      value: "service.name=maven-build,deployment.environment=ci"
+    volumeMounts:
+    - name: m2-cache
+      mountPath: /root/.m2/repository
+    - name: dockerhub-auth
+      mountPath: /root/.docker
+      readOnly: true
+    - name: docker-socket
+      mountPath: /var/run/docker-shared
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:debug
+    command: ["sleep"]
+    args: ["infinity"]
+    resources:
+      requests: { cpu: "50m", memory: "64Mi" }
+      limits:   { cpu: "1", memory: "2Gi" }
+    env:
+    - name: HTTPS_PROXY
+      value: "http://forward-proxy.forward-proxy.svc:3128"
+    - name: HTTP_PROXY
+      value: "http://forward-proxy.forward-proxy.svc:3128"
+    - name: NO_PROXY
+      value: "localhost,127.0.0.1,harbor.adapstory.com,10.0.0.0/8,192.168.0.0/16,.svc,.cluster.local"
+    volumeMounts:
+    - name: docker-config
+      mountPath: /kaniko/.docker
+  - name: trivy
+    image: aquasec/trivy:0.58.0
+    command: ["sleep"]
+    args: ["infinity"]
+    resources:
+      requests: { cpu: "50m", memory: "64Mi" }
+      limits:   { cpu: "1", memory: "1Gi" }
+    env:
+    - name: TRIVY_SERVER_URL
+      value: "http://trivy-server.trivy-system.svc:4954"
+    - name: DOCKER_CONFIG
+      value: "/home/trivy/.docker"
+    volumeMounts:
+    - name: docker-config
+      mountPath: /home/trivy/.docker
+  - name: dind
+    image: docker:27-dind
+    securityContext:
+      privileged: true
+    env:
+    - name: DOCKER_TLS_CERTDIR
+      value: ""
+    command: ["sh", "-c"]
+    args:
+    - |
+      mkdir -p /root/.docker /etc/docker
+      cp /dockerhub-auth/config.json /root/.docker/config.json
+      cat > /etc/docker/daemon.json << 'DAEMON'
+      {
+        "registry-mirrors": ["https://harbor.adapstory.com/v2/dockerhub-cache"],
+        "insecure-registries": ["harbor.adapstory.com"]
+      }
+      DAEMON
+      dockerd-entrypoint.sh --host=unix:///var/run/docker-shared/docker.sock --host=tcp://0.0.0.0:2375 &
+      # Pre-pull Testcontainers images while Maven builds dependencies
+      sleep 8
+      docker pull postgres:16-alpine &
+      docker pull redis:7-alpine &
+      docker pull testcontainers/ryuk:0.11.0 &
+      wait
+    volumeMounts:
+    - name: dind-storage
+      mountPath: /var/lib/docker
+    - name: dockerhub-auth
+      mountPath: /dockerhub-auth
+      readOnly: true
+    - name: docker-socket
+      mountPath: /var/run/docker-shared
+    resources:
+      requests: { cpu: "100m", memory: "256Mi" }
+      limits:   { cpu: "2", memory: "2Gi" }
+  - name: git
+    image: alpine/git:2.47.2
+    command: ["sleep"]
+    args: ["infinity"]
+    env:
+    - name: DOCKER_CONFIG
+      value: "/home/git/.docker"
+    volumeMounts:
+    - name: docker-config
+      mountPath: /home/git/.docker
+  volumes:
+  - name: docker-socket
+    emptyDir: {}
+  - name: dind-storage
+    persistentVolumeClaim:
+      claimName: dind-docker-cache-shared
+  - name: dockerhub-auth
+    secret:
+      secretName: dockerhub-auth
+      items:
+      - key: .dockerconfigjson
+        path: config.json
+  - name: docker-config
+    projected:
+      sources:
+      - secret:
+          name: all-registries-docker-config
+          items:
+          - key: .dockerconfigjson
+            path: config.json
+  - name: m2-cache
+    persistentVolumeClaim:
+      claimName: maven-repo-cache
+'''
+        }
+    }
+
+    options {
+        disableConcurrentBuilds()
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        ansiColor('xterm')
+    }
+
+    parameters {
+        choice(name: 'SERVICE', choices: [
+            'adapstory-bff-admin',
+            'adapstory-bff-student',
+            'adapstory-identity',
+            'adapstory-data-model-engine',
+            'adapstory-multi-tenant-runtime',
+            'adapstory-plugin-lifecycle',
+            'adapstory-plugin-gateway'
+        ], description: 'Service to build and deploy')
+        string(name: 'TAG', defaultValue: '', description: 'Image tag (empty = auto YY.MM.DD-shortSHA)')
+        string(name: 'GIT_BRANCH', defaultValue: 'main', description: 'Branch to build from')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip Maven tests (hotfixes only)')
+        booleanParam(name: 'SKIP_CHECKS', defaultValue: false, description: 'Skip Checkstyle/PMD/SpotBugs (formatting-only commits)')
+        booleanParam(name: 'PUSH_GITHUB_PACKAGES', defaultValue: false, description: 'Also push Maven artifacts to GitHub Packages (mirror)')
+        booleanParam(name: 'PUSH_GHCR', defaultValue: false, description: 'Also push Docker image to GHCR (mirror)')
+    }
+
+    environment {
+        REGISTRY = 'harbor.adapstory.com/adapstory'
+        GHCR_REGISTRY = 'ghcr.io/stepan5024'
+    }
+
+    stages {
+
+        // ── 1. Resolve service config ──
+        stage('Init') {
+            steps {
+                script {
+                    def services = [
+                        'adapstory-bff-admin': [
+                            repo: 'https://github.com/adapstory/adapstory-bff-admin.git',
+                            image: 'bff-admin',
+                            valuesFile: 'apps/dev/values/services/bff-admin.yaml',
+                        ],
+                        'adapstory-bff-student': [
+                            repo: 'https://github.com/adapstory/adapstory-bff-student.git',
+                            image: 'bff-student',
+                            valuesFile: 'apps/dev/values/services/bff-student.yaml',
+                        ],
+                        'adapstory-identity': [
+                            repo: 'https://github.com/adapstory/adapstory-identity.git',
+                            image: 'identity',
+                            valuesFile: 'apps/dev/values/services/identity-service.yaml',
+                        ],
+                        'adapstory-data-model-engine': [
+                            repo: 'https://github.com/adapstory/adapstory-data-model-engine.git',
+                            image: 'data-model-engine',
+                            valuesFile: 'apps/dev/values/services/data-model-engine.yaml',
+                        ],
+                        'adapstory-multi-tenant-runtime': [
+                            repo: 'https://github.com/adapstory/adapstory-multi-tenant-runtime.git',
+                            image: 'multi-tenant-runtime',
+                            valuesFile: 'apps/dev/values/services/multi-tenant-runtime.yaml',
+                        ],
+                        'adapstory-plugin-lifecycle': [
+                            repo: 'https://github.com/adapstory/adapstory-plugin-lifecycle.git',
+                            image: 'plugin-lifecycle',
+                            valuesFile: 'apps/dev/values/services/plugin-lifecycle.yaml',
+                        ],
+                        'adapstory-plugin-gateway': [
+                            repo: 'https://github.com/adapstory/adapstory-plugin-gateway.git',
+                            image: 'plugin-gateway',
+                            valuesFile: 'apps/dev/values/services/plugin-gateway.yaml',
+                        ],
+                    ]
+
+                    def cfg = services[params.SERVICE]
+                    if (!cfg) { error "Unknown service: ${params.SERVICE}" }
+
+                    env.SVC_REPO = cfg.repo
+                    env.SVC_IMAGE = "${env.REGISTRY}/${cfg.image}"
+                    env.SVC_VALUES = cfg.valuesFile
+                    env.SVC_NAME = cfg.image
+
+                    echo "Service: ${params.SERVICE} → image: ${env.SVC_IMAGE}"
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} | ${env.SVC_NAME} | pending"
+                    currentBuild.description = "${params.GIT_BRANCH} | SKIP_TESTS=${params.SKIP_TESTS}"
+                }
+            }
+        }
+
+        // ── 2. Checkout source + dependencies ──
+        stage('Checkout') {
+            steps {
+                dir('service') {
+                    git url: env.SVC_REPO, branch: params.GIT_BRANCH,
+                        credentialsId: 'github-token'
+                }
+                dir('_deps/adapstory-master-pom') {
+                    git url: 'https://github.com/adapstory/adapstory-master-pom.git',
+                        branch: 'main', credentialsId: 'github-token'
+                }
+                dir('_deps/adapstory-shared-libs') {
+                    git url: 'https://github.com/adapstory/adapstory-shared-libs.git',
+                        branch: 'main', credentialsId: 'github-token'
+                }
+                dir('_deps/adapstory-identity') {
+                    git url: 'https://github.com/adapstory/adapstory-identity.git',
+                        branch: 'main', credentialsId: 'github-token'
+                }
+            }
+        }
+
+        // ── 3. Compute version tag ──
+        stage('Compute Tag') {
+            steps {
+                container('git') {
+                    dir('service') {
+                        script {
+                            sh 'git config --global --add safe.directory "$PWD"'
+                            if (params.TAG?.trim()) {
+                                env.IMG_TAG = params.TAG.trim()
+                            } else {
+                                def shortSha = sh(script: 'git rev-parse --short=9 HEAD', returnStdout: true).trim()
+                                def datePart = new Date().format('yy.MM.dd')
+                                env.IMG_TAG = "${datePart}-${shortSha}"
+                            }
+                            echo "Image tag: ${env.IMG_TAG}"
+                            currentBuild.displayName = "#${env.BUILD_NUMBER} | ${env.SVC_NAME} | ${env.IMG_TAG}"
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 4. Maven settings (Nexus mirror + GitHub Packages auth) ──
+        stage('Maven Settings') {
+            steps {
+                container('maven') {
+                    withCredentials([
+                        usernamePassword(credentialsId: 'github-token', usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN'),
+                        string(credentialsId: 'github-packages-token', variable: 'GITHUB_TOKEN'),
+                        usernamePassword(credentialsId: 'nexus-credentials', usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')
+                    ]) {
+                        sh '''
+                            mkdir -p /root/.m2
+                            cat > /root/.m2/settings.xml << SETTINGS
+<?xml version="1.0" encoding="UTF-8"?>
+<settings>
+  <servers>
+    <server>
+      <id>github</id>
+      <username>adapstory</username>
+      <password>${GITHUB_TOKEN}</password>
+    </server>
+    <server>
+      <id>nexus</id>
+      <username>${NEXUS_USER}</username>
+      <password>${NEXUS_PASS}</password>
+    </server>
+    <server>
+      <id>nexus-releases</id>
+      <username>${NEXUS_USER}</username>
+      <password>${NEXUS_PASS}</password>
+    </server>
+    <server>
+      <id>nexus-snapshots</id>
+      <username>${NEXUS_USER}</username>
+      <password>${NEXUS_PASS}</password>
+    </server>
+  </servers>
+  <mirrors>
+    <mirror>
+      <id>nexus</id>
+      <mirrorOf>central,jboss-public-repository</mirrorOf>
+      <url>http://nexus.nexus.svc:8081/repository/maven-public/</url>
+    </mirror>
+  </mirrors>
+</settings>
+SETTINGS
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ── 5. Maven 3-phase dependency install ──
+        stage('Install Dependencies') {
+            options {
+                // Fail fast if deps hang (non-existent artifact, proxy timeout, etc.)
+                // Cold cache (first build after POM change): up to ~40 min (downloads all Spring Boot deps via forward proxy)
+                // Warm cache (PVC-backed m2-cache): ~2 min. True hangs = never finish → 50 min catches them.
+                timeout(time: 50, unit: 'MINUTES')
+            }
+            steps {
+                container('maven') {
+                    // Build Cache disabled for dependency install (cross-repo -pl builds cause Unknown projectId)
+                    // Inline the flag since `def` requires script{} block in declarative pipeline
+
+                    // Phase 0: parent BOM
+                    sh 'mvn install -T 1C -f _deps/adapstory-master-pom/pom.xml -DskipTests -Dmaven.build.cache.enabled=false -B -q'
+
+                    // Phase 1: shared-libs root POM (non-recursive) + core modules
+                    sh 'mvn install -T 1C -N -f _deps/adapstory-shared-libs/pom.xml -DskipTests -Dmaven.build.cache.enabled=false -B -q'
+                    sh '''
+                        mvn install -T 1C -f _deps/adapstory-shared-libs/pom.xml \
+                            -pl adapstory-build-tools,adapstory-domain-primitives,adapstory-commons,adapstory-starter-testing \
+                            -DskipTests -Dspotless.check.skip -Denforcer.skip -Djacoco.skip \
+                            -Dmaven.javadoc.skip -Dmaven.source.skip -Ddependency-check.skip \
+                            -Dmaven.build.cache.enabled=false -B -q
+                    '''
+
+                    // Phase 2: identity root POM (non-recursive) + identity-domain
+                    sh 'mvn install -T 1C -N -f _deps/adapstory-identity/pom.xml -DskipTests -Dmaven.build.cache.enabled=false -B -q'
+                    sh '''
+                        mvn install -T 1C -U -f _deps/adapstory-identity/pom.xml -pl identity-domain \
+                            -Dmaven.test.skip=true -Dspotless.check.skip -Dcheckstyle.skip -Dpmd.skip \
+                            -Dspotbugs.skip -Denforcer.skip -Djacoco.skip -Dmaven.javadoc.skip \
+                            -Dmaven.source.skip -Ddependency-check.skip \
+                            -Dmaven.build.cache.enabled=false -B -q
+                    '''
+
+                    // Phase 3: full shared-libs (all starters)
+                    sh '''
+                        mvn install -T 1C -f _deps/adapstory-shared-libs/pom.xml \
+                            -DskipTests -Dspotless.check.skip -Dcheckstyle.skip -Dpmd.skip \
+                            -Dspotbugs.skip -Denforcer.skip -Djacoco.skip \
+                            -Dmaven.javadoc.skip -Dmaven.source.skip -Ddependency-check.skip \
+                            -Dmaven.build.cache.enabled=false -B -q
+                    '''
+                }
+            }
+        }
+
+        // ── 6. Build & Test service ──
+        stage('Build & Test') {
+            steps {
+                container('maven') {
+                    dir('service') {
+                        script {
+                            // Override OTEL service name with actual service being built
+                            env.OTEL_RESOURCE_ATTRIBUTES = "service.name=maven-build-${env.SVC_NAME},deployment.environment=ci,build.number=${env.BUILD_NUMBER}"
+
+                            def skipChecksFlags = params.SKIP_CHECKS ?
+                                '-Dcheckstyle.skip=true -Dpmd.skip=true -Dspotbugs.skip=true -Dspotless.check.skip=true -Dodc.skip=true -Djacoco.skip=true' : ''
+                            if (params.SKIP_TESTS) {
+                                sh "mvn verify -T 1C -Dmaven.test.skip=true -Dmaven.javadoc.skip=true ${skipChecksFlags} -B"
+                            } else {
+                                sh "mvn verify -T 1C -Dsurefire.useSystemClassLoader=false -Dmaven.javadoc.skip=true ${skipChecksFlags} -B"
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    junit testResults: 'service/**/target/surefire-reports/TEST-*.xml,service/**/target/failsafe-reports/TEST-*.xml',
+                          allowEmptyResults: true
+                }
+            }
+        }
+
+        // ── 7a. Deploy to Nexus (primary) ──
+        stage('Deploy to Nexus') {
+            steps {
+                container('maven') {
+                    dir('service') {
+                        sh 'mvn deploy -DskipTests -B'
+                    }
+                }
+            }
+        }
+
+        // ── 7b. Deploy to GitHub Packages (fallback mirror, non-blocking) ──
+        stage('Deploy to GitHub Packages') {
+            when { expression { params.PUSH_GITHUB_PACKAGES } }
+            steps {
+                container('maven') {
+                    dir('service') {
+                        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                            sh """
+                                mvn deploy -DskipTests -B \
+                                  -DaltDeploymentRepository=github::https://maven.pkg.github.com/adapstory/${params.SERVICE} \
+                                  -DaltSnapshotDeploymentRepository=github::https://maven.pkg.github.com/adapstory/${params.SERVICE}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 8. Kaniko Docker build + push to Harbor (primary) ──
+        stage('Docker Build & Push') {
+            options {
+                timeout(time: 20, unit: 'MINUTES')
+            }
+            steps {
+                container('kaniko') {
+                    sh """
+                    /kaniko/executor \
+                      --context=dir://\${WORKSPACE}/service \
+                      --dockerfile=\${WORKSPACE}/service/Dockerfile \
+                      --destination=${env.SVC_IMAGE}:${env.IMG_TAG} \
+                      --destination=${env.SVC_IMAGE}:dev \
+                      --single-snapshot \
+                      --use-new-run \
+                      --cache=true \
+                      --cache-ttl=168h \
+                      --cache-repo=${env.SVC_IMAGE}/cache
+                    """
+                }
+            }
+        }
+
+        // ── 8b. Copy image to GHCR (fallback, non-blocking) ──
+        stage('Push to GHCR (fallback)') {
+            when { expression { params.PUSH_GHCR } }
+            steps {
+                container('git') {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        sh """
+                        # Install crane
+                        wget -qO- https://github.com/google/go-containerregistry/releases/download/v0.20.3/go-containerregistry_Linux_x86_64.tar.gz | tar xz -C /tmp crane
+
+                        # Copy from Harbor to GHCR
+                        /tmp/crane copy ${env.SVC_IMAGE}:${env.IMG_TAG} ${env.GHCR_REGISTRY}/${env.SVC_NAME}:${env.IMG_TAG}
+                        """
+                    }
+                }
+            }
+        }
+
+        // ── 9. Trivy security scan (non-blocking for dev) ──
+        stage('Trivy Scan') {
+            steps {
+                container('trivy') {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        script {
+                            def fullImage = "${env.SVC_IMAGE}:${env.IMG_TAG}"
+                            sh "trivy image --server \${TRIVY_SERVER_URL} --severity CRITICAL,HIGH --format table ${fullImage}"
+                            sh "trivy image --server \${TRIVY_SERVER_URL} --severity CRITICAL,HIGH --format json --output trivy-report.json ${fullImage}"
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── 9b+9c. Sign image with Cosign + Generate SBOM with Syft (parallel, non-blocking) ──
+        // cosign/syft official images are distroless (no sleep) — download static binaries in git container
+        stage('Sign + SBOM') {
+            parallel {
+                stage('Sign Image (Cosign)') {
+                    steps {
+                        container('git') {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                withCredentials([
+                                    file(credentialsId: 'cosign-private-key', variable: 'COSIGN_KEY'),
+                                    string(credentialsId: 'cosign-key-password', variable: 'COSIGN_PASSWORD')
+                                ]) {
+                                    script {
+                                        def image = "${env.SVC_IMAGE}:${env.IMG_TAG}"
+                                        sh """
+                                            apk add --no-cache curl >/dev/null 2>&1 || true
+                                            curl -sfL https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64 \
+                                                -o /tmp/cosign && chmod +x /tmp/cosign
+                                            COSIGN_REPOSITORY=harbor.adapstory.com/adapstory/signatures \
+                                            DOCKER_CONFIG=/home/git/.docker \
+                                            NO_PROXY=localhost,127.0.0.1,harbor.adapstory.com,10.0.0.0/8,192.168.0.0/16,.svc,.cluster.local \
+                                            COSIGN_PASSWORD=\${COSIGN_PASSWORD} /tmp/cosign sign --key \${COSIGN_KEY} \
+                                                --tlog-upload=false --yes \
+                                                ${image}
+                                        """
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                stage('SBOM (Syft)') {
+                    steps {
+                        container('git') {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                                script {
+                                    def image = "${env.SVC_IMAGE}:${env.IMG_TAG}"
+                                    sh """
+                                        apk add --no-cache curl >/dev/null 2>&1 || true
+                                        curl -sfL https://github.com/anchore/syft/releases/download/v1.18.0/syft_1.18.0_linux_amd64.tar.gz \
+                                            | tar xz -C /tmp syft
+                                        DOCKER_CONFIG=/home/git/.docker \
+                                        SYFT_REGISTRY_AUTH_AUTHORITY=harbor.adapstory.com \
+                                        NO_PROXY=localhost,127.0.0.1,harbor.adapstory.com,10.0.0.0/8,192.168.0.0/16,.svc,.cluster.local \
+                                        /tmp/syft ${image} \
+                                            --output spdx-json=sbom.spdx.json \
+                                            --output cyclonedx-json=sbom.cdx.json \
+                                            --output table
+                                    """
+                                }
+                            }
+                        }
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'sbom*.json', allowEmptyArchive: true
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 10. Update GitOps repo → ArgoCD auto-sync ──
+        stage('Deploy to Dev') {
+            options {
+                timeout(time: 5, unit: 'MINUTES')
+            }
+            steps {
+                container('git') {
+                    withCredentials([usernamePassword(credentialsId: 'github-token', usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')]) {
+                        sh """
+                            rm -rf /tmp/gitops && mkdir -p /tmp/gitops
+                            cd /tmp/gitops
+                            git clone --depth 1 -b main \
+                                https://x-access-token:\${GH_TOKEN}@github.com/adapstory/Adapstory-GitOps.git .
+
+                            git config user.email "jenkins@adapstory.com"
+                            git config user.name "Jenkins CI"
+
+                            sed -i 's|tag:.*|tag: "${env.IMG_TAG}"|' ${env.SVC_VALUES}
+
+                            git add ${env.SVC_VALUES}
+                            git diff --cached --quiet && echo "No changes to commit" || \
+                                git commit -m "deploy(dev): ${env.SVC_NAME} ${env.IMG_TAG}"
+                        """
+
+                        retry(3) {
+                            sh '''
+                                cd /tmp/gitops
+                                git pull --rebase origin main
+                                git push origin main
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 11. DAST — ZAP Baseline Scan (non-blocking for MEDIUM/LOW) ──
+        stage('DAST (ZAP Baseline)') {
+            steps {
+                container('git') {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        script {
+                            // Map service name → internal ClusterIP URL
+                            def serviceUrls = [
+                                'adapstory-bff-admin':            'http://dev-bff-admin-svc.env-dev.svc:8080',
+                                'adapstory-bff-student':          'http://dev-bff-student-svc.env-dev.svc:8080',
+                                'adapstory-identity':             'http://dev-identity-service-svc.env-dev.svc:8082',
+                                'adapstory-data-model-engine':    'http://dev-data-model-engine-svc.env-dev.svc:8081',
+                                'adapstory-multi-tenant-runtime': 'http://dev-multi-tenant-runtime-svc.env-dev.svc:8080',
+                                'adapstory-plugin-lifecycle':     'http://dev-plugin-lifecycle-svc.env-dev.svc:8083',
+                                'adapstory-plugin-gateway':      'http://dev-plugin-gateway-svc.env-dev.svc:8090',
+                            ]
+
+                            def targetUrl = serviceUrls[params.SERVICE]
+                            if (!targetUrl) {
+                                echo "No ZAP target URL configured for ${params.SERVICE}, skipping DAST"
+                                return
+                            }
+
+                            def zapApi = 'http://owasp-zap-svc.owasp-zap.svc:8080'
+                            def zapKey = 'zap-adapstory-2026'
+
+                            // Ensure curl is available
+                            sh 'apk add --no-cache curl jq >/dev/null 2>&1 || true'
+
+                            // Check ZAP server availability first (up to 30s)
+                            def zapReady = sh(
+                                script: """
+                                    for i in \$(seq 1 6); do
+                                        if curl -s --connect-timeout 5 --max-time 10 '${zapApi}/JSON/core/view/version/?apikey=${zapKey}' | grep -q 'version'; then
+                                            echo "ZAP server is available"
+                                            exit 0
+                                        fi
+                                        echo "ZAP attempt \$i/6 — not ready, waiting 5s..."
+                                        sleep 5
+                                    done
+                                    echo "ZAP server is not available, skipping DAST"
+                                    exit 1
+                                """,
+                                returnStatus: true
+                            )
+                            if (zapReady != 0) {
+                                echo "ZAP server unavailable — skipping DAST scan"
+                                return
+                            }
+
+                            // Wait for the service to be reachable (up to 120s after deploy)
+                            def svcReady = sh(
+                                script: """
+                                    echo "Waiting for ${targetUrl} to become available..."
+                                    for i in \$(seq 1 24); do
+                                        if curl -s --connect-timeout 5 --max-time 10 '${targetUrl}/actuator/health' | grep -q 'UP'; then
+                                            echo "Service is UP"
+                                            exit 0
+                                        fi
+                                        echo "Attempt \$i/24 — service not ready, waiting 5s..."
+                                        sleep 5
+                                    done
+                                    echo "Service not available after 120s"
+                                    exit 1
+                                """,
+                                returnStatus: true
+                            )
+                            if (svcReady != 0) {
+                                echo "Target service unavailable — skipping DAST scan"
+                                return
+                            }
+
+                            // 1. Spider the target
+                            sh """
+                                echo "Starting ZAP spider on ${targetUrl}"
+                                SPIDER_RESP=\$(curl -s '${zapApi}/JSON/spider/action/scan/?apikey=${zapKey}&url=${targetUrl}&maxChildren=5')
+                                echo "Spider response: \$SPIDER_RESP"
+                                SCAN_ID=\$(echo "\$SPIDER_RESP" | jq -r '.scan // empty')
+                                if [ -n "\$SCAN_ID" ]; then
+                                    echo "Spider scan ID: \$SCAN_ID"
+                                    for i in \$(seq 1 30); do
+                                        STATUS=\$(curl -s '${zapApi}/JSON/spider/view/status/?apikey=${zapKey}&scanId='\$SCAN_ID | jq -r '.status // "0"')
+                                        echo "Spider progress: \$STATUS%"
+                                        [ "\$STATUS" = "100" ] && break
+                                        sleep 3
+                                    done
+                                fi
+                            """
+
+                            // 2. Passive scan (no active attack — baseline only)
+                            sh """
+                                echo "Starting ZAP passive scan on ${targetUrl}"
+                                PSCAN_RESP=\$(curl -s '${zapApi}/JSON/pscan/view/recordsToScan/?apikey=${zapKey}')
+                                echo "Passive scan status: \$PSCAN_RESP"
+                                # Wait up to 60s for passive scan queue to drain
+                                for i in \$(seq 1 20); do
+                                    REMAINING=\$(curl -s '${zapApi}/JSON/pscan/view/recordsToScan/?apikey=${zapKey}' | jq -r '.recordsToScan // "1"')
+                                    echo "Passive scan records remaining: \$REMAINING"
+                                    [ "\$REMAINING" = "0" ] && break
+                                    sleep 3
+                                done
+                            """
+
+                            // 3. Download reports
+                            sh """
+                                curl -s '${zapApi}/OTHER/core/other/htmlreport/?apikey=${zapKey}' > zap-report.html
+                                curl -s '${zapApi}/JSON/alert/view/alerts/?apikey=${zapKey}&baseurl=${targetUrl}' > zap-alerts.json
+                                echo "ZAP reports downloaded"
+                            """
+
+                            // 4. Evaluate: fail on HIGH, unstable on MEDIUM
+                            sh """
+                                HIGH_COUNT=\$(cat zap-alerts.json | jq '[.alerts[] | select(.risk == "High")] | length')
+                                MEDIUM_COUNT=\$(cat zap-alerts.json | jq '[.alerts[] | select(.risk == "Medium")] | length')
+                                echo "ZAP results: HIGH=\$HIGH_COUNT MEDIUM=\$MEDIUM_COUNT"
+                                if [ "\$HIGH_COUNT" -gt "0" ]; then
+                                    echo "ERROR: \$HIGH_COUNT HIGH-risk ZAP alerts found!"
+                                    exit 1
+                                fi
+                                if [ "\$MEDIUM_COUNT" -gt "0" ]; then
+                                    echo "WARNING: \$MEDIUM_COUNT MEDIUM-risk ZAP alerts found (not blocking)"
+                                    exit 2
+                                fi
+                            """
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'zap-report.html,zap-alerts.json', allowEmptyArchive: true
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Deployed ${env.SVC_NAME}:${env.IMG_TAG} to dev"
+        }
+        failure {
+            echo "Deploy FAILED: ${params.SERVICE}"
+        }
+        regression {
+            container('maven') {
+                script {
+                    catchError(buildResult: currentBuild.currentResult, stageResult: 'UNSTABLE') {
+                        withCredentials([
+                            string(credentialsId: 'telegram-bot-token', variable: 'TG_TOKEN'),
+                            string(credentialsId: 'telegram-chat-id', variable: 'TG_CHAT')
+                        ]) {
+                            sh """
+                                curl -s --connect-timeout 10 --max-time 30 \\
+                                    -X POST "http://telegram-bot-api.backup.svc.cluster.local:8081/bot\${TG_TOKEN}/sendMessage" \\
+                                    -d chat_id="\${TG_CHAT}" \\
+                                    -d parse_mode="Markdown" \\
+                                    -d text="🚨 *REGRESSION*: \\`${env.SVC_NAME ?: params.SERVICE}\\` broke on \\`${params.GIT_BRANCH}\\`\\n[Build #${env.BUILD_NUMBER}](${env.BUILD_URL})" || true
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        fixed {
+            container('maven') {
+                script {
+                    catchError(buildResult: currentBuild.currentResult, stageResult: 'UNSTABLE') {
+                        withCredentials([
+                            string(credentialsId: 'telegram-bot-token', variable: 'TG_TOKEN'),
+                            string(credentialsId: 'telegram-chat-id', variable: 'TG_CHAT')
+                        ]) {
+                            sh """
+                                curl -s --connect-timeout 10 --max-time 30 \\
+                                    -X POST "http://telegram-bot-api.backup.svc.cluster.local:8081/bot\${TG_TOKEN}/sendMessage" \\
+                                    -d chat_id="\${TG_CHAT}" \\
+                                    -d parse_mode="Markdown" \\
+                                    -d text="✅ *FIXED*: \\`${env.SVC_NAME ?: params.SERVICE}\\` is back to green on \\`${params.GIT_BRANCH}\\`\\n[Build #${env.BUILD_NUMBER}](${env.BUILD_URL})" || true
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        always {
+            // ── Build metrics export to Prometheus Pushgateway ──
+            container('maven') {
+                script {
+                    catchError(buildResult: currentBuild.currentResult, stageResult: 'UNSTABLE') {
+                        buildMetrics.export(
+                            service: env.SVC_NAME,
+                            branch: params.GIT_BRANCH,
+                            surefirePattern: 'service/**/target/surefire-reports/TEST-*.xml',
+                            failsafePattern: 'service/**/target/failsafe-reports/TEST-*.xml',
+                            gcLogPath: '/tmp/build-gc.log'
+                        )
+
+                        // Grafana deploy annotation marker
+                        buildMetrics.postDeployAnnotation(
+                            service: env.SVC_NAME,
+                            tag: env.IMG_TAG,
+                            branch: params.GIT_BRANCH,
+                            buildUrl: env.BUILD_URL,
+                            buildNumber: env.BUILD_NUMBER,
+                            status: currentBuild.currentResult ?: 'UNKNOWN',
+                            duration: ((currentBuild.duration ?: 0) / 1000).intValue()
+                        )
+                    }
+                }
+            }
+
+            // ── Telegram notification with performance delta ──
+            container('maven') {
+                script {
+                    catchError(buildResult: currentBuild.currentResult, stageResult: 'UNSTABLE') {
+                        def status = currentBuild.currentResult ?: 'UNKNOWN'
+                        def duration = (currentBuild.duration ?: 0) / 1000.0
+
+                        // Read metrics from build-metrics.json (created by buildMetrics.export)
+                        def testCount = 0
+                        def testFailures = 0
+                        def warnings = 0
+                        def gcPauseMs = 0.0
+                        def cacheHits = 0
+                        def cacheMisses = 0
+                        def slowestTestSec = 0.0
+                        try {
+                            if (fileExists('build-metrics.json')) {
+                                def metrics = readJSON file: 'build-metrics.json'
+                                testCount = metrics?.tests?.total ?: 0
+                                testFailures = metrics?.tests?.failures ?: 0
+                                warnings = metrics?.maven?.warnings ?: 0
+                                gcPauseMs = metrics?.gc?.totalPauseMs ?: 0.0
+                                cacheHits = metrics?.maven?.cacheHitsNexus ?: 0
+                                cacheMisses = metrics?.maven?.cacheMissesCentral ?: 0
+                                def slowest = metrics?.tests?.slowestTests
+                                if (slowest && slowest.size() > 0) {
+                                    slowestTestSec = slowest[0].time ?: 0.0
+                                }
+                            }
+                        } catch (Exception e) {
+                            echo "Metrics JSON read skipped: ${e.message}"
+                        }
+
+                        // Read new dependencies from metrics
+                        def newDeps = []
+                        try {
+                            if (fileExists('build-metrics.json')) {
+                                def m = readJSON file: 'build-metrics.json'
+                                newDeps = m?.maven?.newDependencies ?: []
+                            }
+                        } catch (Exception ignored) {}
+
+                        def tgText = buildMetrics.formatTelegramReport(
+                            service: env.SVC_NAME,
+                            tag: env.IMG_TAG,
+                            branch: params.GIT_BRANCH,
+                            buildUrl: env.BUILD_URL,
+                            buildNumber: env.BUILD_NUMBER,
+                            status: status,
+                            duration: duration,
+                            testCount: testCount,
+                            testFailures: testFailures,
+                            warnings: warnings,
+                            gcPauseMs: gcPauseMs,
+                            cacheHits: cacheHits,
+                            cacheMisses: cacheMisses,
+                            slowestTestSec: slowestTestSec,
+                            newDependencies: newDeps
+                        )
+
+                        withCredentials([
+                            string(credentialsId: 'telegram-bot-token', variable: 'TG_TOKEN'),
+                            string(credentialsId: 'telegram-chat-id', variable: 'TG_CHAT')
+                        ]) {
+                            sh """
+                                curl -s --connect-timeout 10 --max-time 30 \
+                                    -X POST "http://telegram-bot-api.backup.svc.cluster.local:8081/bot\${TG_TOKEN}/sendMessage" \
+                                    -d chat_id="\${TG_CHAT}" \
+                                    -d parse_mode="Markdown" \
+                                    -d text="${tgText}" || true
+                            """
+                        }
+                    }
+                }
+            }
+            cleanWs()
+        }
+    }
+}

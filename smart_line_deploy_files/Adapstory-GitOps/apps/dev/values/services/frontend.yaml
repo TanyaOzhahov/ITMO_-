@@ -1,0 +1,109 @@
+# Adapstory Frontend (dev) — Next.js student-facing app
+# Chart: universal-service
+# Domain: dev.adapstory.com (path: /portal)
+image:
+  repository: harbor.adapstory.com/adapstory/frontend
+  name: frontend
+  tag: "26.04.13-232dc93e6"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: harbor-registry
+
+replicas: 2
+
+remoteComputeScheduling:
+  enabled: true
+  preferredSites:
+    - home-laptop
+    - cloud
+  weight: 95
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+service:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+
+ingress:
+  enabled: true
+  ingressClassName: traefik
+  hosts:
+    - dev.adapstory.com
+    - dev.adapstory.ru
+  # Multiple paths: /portal (student app) + /web-api/adapstory/student (Next.js BFF proxy rewrite)
+  # /oauth2 — Spring Security OAuth2 login flow (proxied to BFF Student via Next.js rewrites)
+  paths:
+    - path: /portal
+      pathType: Prefix
+  pathType: Prefix
+  tls: true
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+
+livenessProbe:
+  httpGet:
+    path: /portal/api/health
+    port: 3000
+  initialDelaySeconds: 30
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 5
+
+readinessProbe:
+  httpGet:
+    path: /portal/api/health
+    port: 3000
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+
+startupProbe:
+  httpGet:
+    path: /portal/api/health
+    port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 6
+  timeoutSeconds: 3
+
+extraEnv:
+  - name: NODE_ENV
+    value: "production"
+  - name: BFF_URL
+    value: "http://dev-bff-student-svc.env-dev.svc.cluster.local:8080"
+  - name: NEXT_PUBLIC_TENANT_SLUG
+    value: "demo"
+  - name: NEXT_PUBLIC_API_URL
+    value: "https://dev.adapstory.com"
+  - name: NEXT_PUBLIC_KEYCLOAK_URL
+    value: "https://auth.dev.adapstory.com"
+  - name: NEXT_PUBLIC_KEYCLOAK_REALM
+    value: "adapstory"
+  - name: OTEL_SERVICE_NAME
+    value: "adapstory-student"
+  - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+    value: "http://dev-opentelemetry-collector.env-dev.svc.cluster.local:4318/v1/traces"
+  - name: OTEL_SDK_DISABLED
+    value: "false"
+  - name: LOG_LEVEL
+    value: "info"

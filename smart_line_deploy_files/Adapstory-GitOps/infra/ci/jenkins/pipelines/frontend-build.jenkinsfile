@@ -1,0 +1,582 @@
+// frontend-build.jenkinsfile
+// Builds Adapstory Frontend (Next.js) and deploys through GitOps.
+// Jenkins Pipeline job SCM: adapstory-gitops.git, Script Path: infra/ci/jenkins/pipelines/frontend-build.jenkinsfile
+//
+// Source: adapstory/adapstory-frontend
+// Flow: Checkout → Compute Tag → npm install → Lint → Build → Docker push → GHCR mirror →
+//       Trivy scan → Cosign sign → SBOM → Deploy to Dev (GitOps) → DAST (ZAP)
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins/pipeline: frontend-build
+spec:
+  priorityClassName: ci-build
+  priority: 200000
+  preemptionPolicy: PreemptLowerPriority
+  containers:
+  - name: node
+    image: node:22-alpine
+    command: ["sleep"]
+    args: ["infinity"]
+    resources:
+      requests: { cpu: "200m", memory: "512Mi" }
+      limits:   { cpu: "2", memory: "4Gi" }
+    env:
+    - name: HTTPS_PROXY
+      value: "http://forward-proxy.forward-proxy.svc:3128"
+    - name: HTTP_PROXY
+      value: "http://forward-proxy.forward-proxy.svc:3128"
+    - name: NO_PROXY
+      value: "harbor.adapstory.com,10.0.0.0/8,192.168.0.0/16,.svc,.cluster.local"
+    - name: npm_config_cache
+      value: "/npm-cache"
+    volumeMounts:
+    - name: npm-cache
+      mountPath: /npm-cache
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:debug
+    command: ["sleep"]
+    args: ["infinity"]
+    resources:
+      requests: { cpu: "200m", memory: "512Mi" }
+      limits:   { cpu: "2", memory: "4Gi" }
+    env:
+    - name: HTTPS_PROXY
+      value: "http://forward-proxy.forward-proxy.svc:3128"
+    - name: HTTP_PROXY
+      value: "http://forward-proxy.forward-proxy.svc:3128"
+    - name: NO_PROXY
+      value: "harbor.adapstory.com,10.0.0.0/8,192.168.0.0/16,.svc,.cluster.local"
+    volumeMounts:
+    - name: docker-config
+      mountPath: /kaniko/.docker
+  - name: trivy
+    image: aquasec/trivy:0.58.0
+    command: ["sleep"]
+    args: ["infinity"]
+    resources:
+      requests: { cpu: "100m", memory: "256Mi" }
+      limits:   { cpu: "1", memory: "1Gi" }
+    env:
+    - name: TRIVY_SERVER_URL
+      value: "http://trivy-server.trivy-system.svc:4954"
+    - name: DOCKER_CONFIG
+      value: "/home/trivy/.docker"
+    volumeMounts:
+    - name: docker-config
+      mountPath: /home/trivy/.docker
+  - name: git
+    image: harbor.adapstory.com/adapstory/ci-git:1.0
+    command: ["sleep"]
+    args: ["infinity"]
+    env:
+    - name: DOCKER_CONFIG
+      value: "/home/git/.docker"
+    volumeMounts:
+    - name: docker-config
+      mountPath: /home/git/.docker
+  volumes:
+  - name: npm-cache
+    persistentVolumeClaim:
+      claimName: npm-cache-shared
+  - name: docker-config
+    projected:
+      sources:
+      - secret:
+          name: all-registries-docker-config
+          items:
+          - key: .dockerconfigjson
+            path: config.json
+'''
+        }
+    }
+
+    options {
+        disableConcurrentBuilds()
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        ansiColor('xterm')
+    }
+
+    parameters {
+        choice(name: 'APP_NAME', choices: ['student', 'admin', 'school'], description: 'Which Next.js app to build (maps to packages/<APP_NAME>)')
+        string(name: 'TAG', defaultValue: '', description: 'Docker image tag (auto-generated YY.MM.DD-shortSHA if empty)')
+        string(name: 'GIT_BRANCH', defaultValue: 'main', description: 'Branch to build from')
+        choice(name: 'DEPLOY_ENV', choices: ['dev', 'prod'], description: 'Target environment for GitOps values and BFF rewrites')
+        booleanParam(name: 'SKIP_LINT', defaultValue: false, description: 'Skip ESLint (formatting-only commits)')
+        string(name: 'BFF_URL', defaultValue: '', description: 'BFF endpoint for Next.js rewrites. Auto-derived from APP_NAME if empty.')
+        string(name: 'BFF_SCHOOL_URL', defaultValue: '', description: 'School BFF endpoint for school portal rewrites. Auto-derived for APP_NAME=school if empty.')
+    }
+
+    stages {
+
+        // ── 1. Checkout ──
+        stage('Checkout') {
+            steps {
+                dir('frontend') {
+                    git url: 'https://github.com/adapstory/adapstory-frontend.git',
+                        branch: params.GIT_BRANCH,
+                        credentialsId: 'github-token'
+                }
+            }
+        }
+
+        // ── 2. Compute tag + derive image/values paths from APP_NAME ──
+        stage('Compute Tag') {
+            steps {
+                container('git') {
+                    dir('frontend') {
+                        script {
+                            def deployEnv = params.DEPLOY_ENV ?: 'dev'
+                            sh 'git config --global --add safe.directory "$PWD"'
+                            if (params.TAG?.trim()) {
+                                env.IMG_TAG = params.TAG.trim()
+                            } else {
+                                def shortSha = sh(script: 'git rev-parse --short=9 HEAD', returnStdout: true).trim()
+                                def datePart = new Date().format('yy.MM.dd')
+                                env.IMG_TAG = "${datePart}-${shortSha}"
+                            }
+                            // student → "frontend", admin → "frontend-admin", school → "frontend-school"
+                            def suffix = params.APP_NAME == 'student' ? '' : "-${params.APP_NAME}"
+                            env.IMAGE       = "harbor.adapstory.com/adapstory/frontend${suffix}"
+                            env.GHCR_IMAGE  = "ghcr.io/stepan5024/frontend${suffix}"
+                            env.VALUES_FILE = params.APP_NAME == 'student'
+                                ? "apps/${deployEnv}/values/services/frontend.yaml"
+                                : "apps/${deployEnv}/values/services/frontend-${params.APP_NAME}.yaml"
+                            echo "Image tag: ${env.IMG_TAG}"
+                            echo "Harbor image: ${env.IMAGE}"
+                            echo "Values file: ${env.VALUES_FILE}"
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 2b. Resolve BFF URL from APP_NAME ──
+        stage('Resolve BFF URL') {
+            steps {
+                script {
+                    if (params.BFF_URL?.trim()) {
+                        env.RESOLVED_BFF_URL = params.BFF_URL.trim()
+                        echo "Using explicit BFF_URL: ${env.RESOLVED_BFF_URL}"
+                    } else {
+                        def deployEnv = params.DEPLOY_ENV ?: 'dev'
+                        def prefix = (deployEnv == 'prod') ? 'prod' : 'dev'
+                        def ns = (deployEnv == 'prod') ? 'env-prod' : 'env-dev'
+                        def bffMap = [
+                            'student': "http://${prefix}-bff-student-svc.${ns}.svc.cluster.local:8080",
+                            'admin'  : "http://${prefix}-bff-admin-svc.${ns}.svc.cluster.local:8080",
+                            'school' : "http://${prefix}-bff-admin-svc.${ns}.svc.cluster.local:8080",
+                        ]
+                        env.RESOLVED_BFF_URL = bffMap[params.APP_NAME]
+                        if (!env.RESOLVED_BFF_URL) {
+                            error "No BFF_URL mapping for APP_NAME='${params.APP_NAME}'. Add entry to bffMap or pass BFF_URL explicitly."
+                        }
+                        echo "Auto-derived BFF_URL for '${params.APP_NAME}': ${env.RESOLVED_BFF_URL}"
+                    }
+
+                    if (params.APP_NAME == 'school') {
+                        if (params.BFF_SCHOOL_URL?.trim()) {
+                            env.RESOLVED_BFF_SCHOOL_URL = params.BFF_SCHOOL_URL.trim()
+                            echo "Using explicit BFF_SCHOOL_URL: ${env.RESOLVED_BFF_SCHOOL_URL}"
+                        } else {
+                            def deployEnv = params.DEPLOY_ENV ?: 'dev'
+                            def prefix = (deployEnv == 'prod') ? 'prod' : 'dev'
+                            def ns = (deployEnv == 'prod') ? 'env-prod' : 'env-dev'
+                            env.RESOLVED_BFF_SCHOOL_URL = "http://${prefix}-bff-school-svc.${ns}.svc.cluster.local:8085"
+                            echo "Auto-derived BFF_SCHOOL_URL for '${params.APP_NAME}': ${env.RESOLVED_BFF_SCHOOL_URL}"
+                        }
+                    } else {
+                        env.RESOLVED_BFF_SCHOOL_URL = ''
+                    }
+                }
+            }
+        }
+
+        // ── 3. Install dependencies ──
+        stage('Install Dependencies') {
+            steps {
+                container('node') {
+                    dir('frontend') {
+                        retry(3) {
+                            sh '''
+                                set -euo pipefail
+
+                                # Enable corepack so turbo can find the declared package manager (pnpm/yarn)
+                                corepack enable
+                                corepack install
+
+                                # Detect package manager from packageManager field in package.json
+                                PM=$(node -e "try{const p=require('./package.json');const pm=(p.packageManager||'npm').split('@')[0];console.log(pm)}catch(e){console.log('npm')}")
+                                echo "Package manager: $PM"
+
+                                # Route package manager traffic through internal Nexus proxy (bypasses flaky forward proxy)
+                                $PM config set registry http://nexus.nexus.svc:8081/repository/npm-group/ || true
+                                $PM config set fetch-retries 5 || true
+                                $PM config set fetch-retry-mintimeout 20000 || true
+                                $PM config set fetch-retry-maxtimeout 120000 || true
+                                $PM config set fetch-timeout 300000 || true
+                                $PM config set prefer-offline true || true
+
+                                INSTALL_CMD="$PM install"
+
+                                if [ "$PM" = "pnpm" ]; then
+                                    # Use shared PVC as pnpm content-addressable store and reduce fan-out on slow Nexus
+                                    $PM config set store-dir /npm-cache
+                                    $PM config set network-concurrency 8
+                                    INSTALL_CMD="$PM install --frozen-lockfile"
+                                fi
+
+                                if [ "$PM" = "yarn" ]; then
+                                    INSTALL_CMD="$PM install --immutable"
+                                fi
+
+                                for attempt in 1 2 3; do
+                                    if sh -c "$INSTALL_CMD"; then
+                                        exit 0
+                                    fi
+
+                                    if [ "$attempt" -eq 3 ]; then
+                                        echo "Dependency install failed after $attempt attempts"
+                                        exit 1
+                                    fi
+
+                                    echo "Dependency install attempt $attempt failed, retrying after Nexus backoff..."
+                                    rm -rf /npm-cache/tmp node_modules/.pnpm/.tmp node_modules/.cache || true
+                                    sleep $((attempt * 15))
+                                done
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 4. Lint (non-blocking for dev) ──
+        stage('Lint') {
+            when {
+                expression { !params.SKIP_LINT }
+            }
+            steps {
+                container('node') {
+                    dir('frontend') {
+                        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                            // Filter by APP_NAME to only lint the target package (+ its deps)
+                            sh """
+                                PM=\$(node -e "try{const p=require('./package.json');const pm=(p.packageManager||'npm').split('@')[0];console.log(pm)}catch(e){console.log('npm')}")
+                                \$PM run lint --filter=@adapstory/${params.APP_NAME}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 5. Build Next.js app ──
+        stage('Build') {
+            steps {
+                container('node') {
+                    dir('frontend') {
+                        // Filter by APP_NAME — only build the target package.
+                        withEnv([
+                            "BFF_URL=${env.RESOLVED_BFF_URL}",
+                            "BFF_SCHOOL_URL=${env.RESOLVED_BFF_SCHOOL_URL ?: ''}",
+                        ]) {
+                            sh """
+                                PM=\$(node -e "try{const p=require('./package.json');const pm=(p.packageManager||'npm').split('@')[0];console.log(pm)}catch(e){console.log('npm')}")
+                                \$PM run build --filter=@adapstory/${params.APP_NAME}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 6. Locate Dockerfile (root of monorepo) ──
+        stage('Find Dockerfile') {
+            steps {
+                script {
+                    env.DOCKERFILE_PATH = "${env.WORKSPACE}/frontend/Dockerfile"
+                    echo "Using Dockerfile: ${env.DOCKERFILE_PATH}"
+                }
+            }
+        }
+
+        // ── 7. Docker build & push to Harbor ──
+        stage('Docker Build & Push') {
+            steps {
+                container('kaniko') {
+                    sh """
+                    /kaniko/executor \
+                      --context=dir://\${WORKSPACE}/frontend \
+                      --dockerfile=\${DOCKERFILE_PATH} \
+                      --build-arg=APP_NAME=${params.APP_NAME} \
+                      --build-arg=BFF_URL=${env.RESOLVED_BFF_URL} \
+                      --build-arg=BFF_SCHOOL_URL=${env.RESOLVED_BFF_SCHOOL_URL} \
+                      --destination=${IMAGE}:${env.IMG_TAG} \
+                      --single-snapshot \
+                      --use-new-run \
+                      --cache=true \
+                      --cache-ttl=168h \
+                      --cache-repo=${IMAGE}/cache
+                    """
+                }
+            }
+        }
+
+        // ── 7. Push to GHCR (fallback, non-blocking) ──
+        stage('Push to GHCR (fallback)') {
+            steps {
+                container('git') {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        sh """
+                        wget -qO- https://github.com/google/go-containerregistry/releases/download/v0.20.3/go-containerregistry_Linux_x86_64.tar.gz | tar xz -C /tmp crane
+                        /tmp/crane copy ${IMAGE}:${env.IMG_TAG} ${GHCR_IMAGE}:${env.IMG_TAG}
+                        """
+                    }
+                }
+            }
+        }
+
+        // ── 8. Trivy security scan (non-blocking for dev) ──
+        stage('Trivy Scan') {
+            steps {
+                container('trivy') {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        sh "trivy image --server \${TRIVY_SERVER_URL} --severity CRITICAL,HIGH --format table ${IMAGE}:${env.IMG_TAG}"
+                        sh "trivy image --server \${TRIVY_SERVER_URL} --severity CRITICAL,HIGH --format json --output trivy-report.json ${IMAGE}:${env.IMG_TAG}"
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── 9. Sign Image (Cosign) ──
+        stage('Sign Image (Cosign)') {
+            steps {
+                // cosign official images are distroless (no sleep/sh) — download static binary into git container instead
+                container('git') {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        withCredentials([
+                            file(credentialsId: 'cosign-private-key', variable: 'COSIGN_KEY'),
+                            string(credentialsId: 'cosign-key-password', variable: 'COSIGN_PASSWORD')
+                        ]) {
+                            sh """
+                                apk add --no-cache curl >/dev/null 2>&1 || true
+                                curl -sfL https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64 \
+                                    -o /tmp/cosign && chmod +x /tmp/cosign
+                                COSIGN_REPOSITORY=harbor.adapstory.com/adapstory/signatures \
+                                DOCKER_CONFIG=/home/git/.docker \
+                                NO_PROXY=harbor.adapstory.com,10.0.0.0/8,192.168.0.0/16,.svc,.cluster.local \
+                                COSIGN_PASSWORD=\${COSIGN_PASSWORD} /tmp/cosign sign --key \${COSIGN_KEY} \
+                                    --tlog-upload=false --yes \
+                                    ${IMAGE}:${env.IMG_TAG}
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 10. SBOM ──
+        stage('SBOM (Trivy)') {
+            steps {
+                container('trivy') {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        sh """
+                            trivy image --server \${TRIVY_SERVER_URL} --format cyclonedx \
+                                --output sbom.cdx.json ${IMAGE}:${env.IMG_TAG}
+                            trivy image --server \${TRIVY_SERVER_URL} --format spdx-json \
+                                --output sbom.spdx.json ${IMAGE}:${env.IMG_TAG}
+                            echo "SBOM files:"; ls -lh sbom*.json
+                        """
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'sbom*.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ── 11. Update GitOps repo → ArgoCD auto-sync ──
+        stage('Deploy to Dev') {
+            steps {
+                container('git') {
+                    withCredentials([usernamePassword(credentialsId: 'github-token', usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')]) {
+                        sh """
+                            rm -rf /tmp/gitops && mkdir -p /tmp/gitops
+                            cd /tmp/gitops
+                            git clone --depth 1 -b main \
+                                https://x-access-token:\${GH_TOKEN}@github.com/adapstory/Adapstory-GitOps.git .
+
+                            git config user.email "jenkins@adapstory.com"
+                            git config user.name "Jenkins CI"
+                            test -f ${VALUES_FILE}
+
+                            sed -i 's|tag:.*|tag: "${env.IMG_TAG}"|' ${VALUES_FILE}
+
+                            git add ${VALUES_FILE}
+                            git diff --cached --quiet && echo "No changes to commit" || \
+                                git commit -m "deploy(${params.DEPLOY_ENV}): frontend-${params.APP_NAME} ${env.IMG_TAG}"
+                        """
+
+                        retry(3) {
+                            sh '''
+                                cd /tmp/gitops
+                                git pull --rebase origin main
+                                git push origin main
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 12. DAST — ZAP Baseline Scan ──
+        stage('DAST (ZAP Baseline)') {
+            steps {
+                container('git') {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        sh """
+                            apk add --no-cache curl jq >/dev/null 2>&1 || true
+                            ZAP=http://owasp-zap-svc.owasp-zap.svc:8080
+                            PREFIX=\$([ "${params.DEPLOY_ENV}" = "prod" ] && echo prod || echo dev)
+                            NS=\$([ "${params.DEPLOY_ENV}" = "prod" ] && echo env-prod || echo env-dev)
+                            case "${params.APP_NAME}" in
+                              student)
+                                TARGET="http://\${PREFIX}-frontend-svc.\${NS}.svc:3000"
+                                HEALTH_PATH="/portal/api/health"
+                                ;;
+                              admin)
+                                TARGET="http://\${PREFIX}-frontend-admin-svc.\${NS}.svc:3000"
+                                HEALTH_PATH="/admin/api/health"
+                                ;;
+                              school)
+                                TARGET="http://\${PREFIX}-frontend-school-svc.\${NS}.svc:3000"
+                                HEALTH_PATH="/manage/api/health"
+                                ;;
+                              *) echo "Unsupported APP_NAME for DAST: ${params.APP_NAME}" >&2; exit 1 ;;
+                            esac
+
+                            write_skip_artifacts() {
+                                printf '{"alerts":[]}\n' > zap-alerts.json
+                                printf '<html><body>%s</body></html>\n' "\$1" > zap-report.html
+                            }
+
+                            # Wait for service health
+                            echo "Waiting for \${TARGET}\${HEALTH_PATH} to become healthy..."
+                            SERVICE_UP=false
+                            for i in \$(seq 1 18); do
+                                if curl -sf --connect-timeout 5 --max-time 10 \${TARGET}\${HEALTH_PATH} | jq -e '.status == "ok"' >/dev/null 2>&1; then
+                                    SERVICE_UP=true
+                                    echo "Service is healthy after attempt \$i"
+                                    break
+                                fi
+                                echo "Attempt \$i/18 — service not healthy yet, waiting 10s..."
+                                sleep 10
+                            done
+
+                            if [ "\$SERVICE_UP" != "true" ]; then
+                                echo "WARNING: \${TARGET}\${HEALTH_PATH} did not become healthy — skipping DAST"
+                                write_skip_artifacts "Service health endpoint did not become ready — DAST skipped"
+                                exit 0
+                            fi
+
+                            if ! curl -sf --connect-timeout 5 --max-time 10 "\${ZAP}/JSON/core/view/version/" >/dev/null 2>&1; then
+                                echo "WARNING: ZAP is unavailable — skipping DAST"
+                                write_skip_artifacts "ZAP is unavailable — DAST skipped"
+                                exit 0
+                            fi
+
+                            # Spider
+                            SCAN_ID=\$(curl -sf "\${ZAP}/JSON/spider/action/scan/?url=\${TARGET}&recurse=true" | jq -r '.scan // empty')
+                            if [ -z "\$SCAN_ID" ]; then
+                                echo "WARNING: ZAP spider failed to start"
+                                write_skip_artifacts "ZAP spider failed to start — DAST skipped"
+                                exit 0
+                            fi
+                            echo "Spider scan ID: \${SCAN_ID}"
+
+                            for i in \$(seq 1 30); do
+                                STATUS=\$(curl -sf "\${ZAP}/JSON/spider/view/status/?scanId=\${SCAN_ID}" | jq -r '.status // "0"')
+                                echo "Spider progress: \${STATUS}%"
+                                [ "\${STATUS}" = "100" ] && break
+                                sleep 3
+                            done
+
+                            for i in \$(seq 1 20); do
+                                REMAINING=\$(curl -sf "\${ZAP}/JSON/pscan/view/recordsToScan/" | jq -r '.recordsToScan // "1"')
+                                echo "Passive scan records remaining: \${REMAINING}"
+                                [ "\${REMAINING}" = "0" ] && break
+                                sleep 3
+                            done
+
+                            # Get alerts
+                            curl -sf "\${ZAP}/JSON/alert/view/alerts/?baseurl=\${TARGET}" -o zap-alerts.json || printf '{"alerts":[]}\n' > zap-alerts.json
+                            HIGH=\$(jq '[.alerts[]|select(.risk=="High")]|length' zap-alerts.json 2>/dev/null || echo 0)
+                            echo "ZAP HIGH alerts: \${HIGH}"
+
+                            # Generate report
+                            curl -sf "\${ZAP}/OTHER/core/other/htmlreport/" -o zap-report.html || \
+                                printf '<html><body>No ZAP report</body></html>\n' > zap-report.html
+
+                            if [ "\${HIGH}" -gt 5 ]; then
+                                echo "WARNING: \${HIGH} HIGH severity issues found"
+                            fi
+                        """
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'zap-report.html,zap-alerts.json', allowEmptyArchive: true
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Deployed frontend-${params.APP_NAME}:${env.IMG_TAG} to ${params.DEPLOY_ENV}"
+        }
+        failure {
+            echo "Frontend build FAILED"
+        }
+        always {
+            script {
+                def status = currentBuild.currentResult ?: 'UNKNOWN'
+                def emoji = (status == 'SUCCESS') ? '%E2%9C%85' : '%E2%9D%8C'
+
+                withCredentials([
+                    string(credentialsId: 'telegram-bot-token', variable: 'TG_TOKEN'),
+                    string(credentialsId: 'telegram-chat-id', variable: 'TG_CHAT')
+                ]) {
+                    container('git') {
+                        sh """
+                            apk add --no-cache curl >/dev/null 2>&1 || true
+                            curl -s --connect-timeout 10 --max-time 30 \
+                                -X POST "http://telegram-bot-api.backup.svc.cluster.local:8081/bot\${TG_TOKEN}/sendMessage" \
+                                -d chat_id="\${TG_CHAT}" \
+                                -d parse_mode="Markdown" \
+                                -d text="${emoji} *Frontend Build*%0AStatus: *${status}*%0ATag: %60${env.IMG_TAG}%60%0ABuild: [%23${env.BUILD_NUMBER}](${env.BUILD_URL})" || true
+                        """
+                    }
+                }
+            }
+            cleanWs()
+        }
+    }
+}

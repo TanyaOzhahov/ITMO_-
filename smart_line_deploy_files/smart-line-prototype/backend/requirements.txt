@@ -1,0 +1,5 @@
+openai>=1.50
+qdrant-client>=1.11
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.8

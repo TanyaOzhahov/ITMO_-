@@ -1,0 +1,187 @@
+version: '3.9'
+
+services:
+  # ─────────────────────────────────────────────────────────
+  # PostgreSQL Database (BC-19: multi-tenant-runtime)
+  # ─────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: adapstory-postgres-smart-line
+    environment:
+      POSTGRES_DB: adapstory
+      POSTGRES_USER: adapstory
+      POSTGRES_PASSWORD: adapstory-local
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./specs/smart-line-database-schema.sql:/docker-entrypoint-initdb.d/01-smart-line.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U adapstory"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - adapstory-smart-line
+
+  # ─────────────────────────────────────────────────────────
+  # Redis (StudentState caching, Widget versioning)
+  # ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: adapstory-redis-smart-line
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - adapstory-smart-line
+
+  # ─────────────────────────────────────────────────────────
+  # Zookeeper (Kafka coordination)
+  # ─────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: adapstory-zookeeper-smart-line
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - adapstory-smart-line
+
+  # ─────────────────────────────────────────────────────────
+  # Kafka (Event streaming: WidgetRendered, StudentAnswered, etc.)
+  # ─────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: adapstory-kafka-smart-line
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions.sh", "--bootstrap-server", "kafka:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - adapstory-smart-line
+
+  # ─────────────────────────────────────────────────────────
+  # Smart Line Widget Lake Service (BC-16: Personalization Runtime)
+  # ─────────────────────────────────────────────────────────
+  personalization-runtime:
+    build:
+      context: ./adapstory-personalization-runtime
+      dockerfile: Dockerfile
+    container_name: adapstory-personalization-runtime-smart-line
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      # Server
+      SERVER_PORT: 8080
+      SERVER_SERVLET_CONTEXT_PATH: /api
+      
+      # Spring Profiles
+      SPRING_PROFILES_ACTIVE: smart-line
+      
+      # Database (PostgreSQL)
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/adapstory
+      SPRING_DATASOURCE_USERNAME: adapstory
+      SPRING_DATASOURCE_PASSWORD: adapstory-local
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: 10
+      SPRING_DATASOURCE_HIKARI_MINIMUM_IDLE: 3
+      
+      # Redis (StudentState caching)
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PORT: 6379
+      SPRING_REDIS_TIMEOUT: 5000ms
+      SPRING_REDIS_LETTUCE_POOL_MAX_ACTIVE: 20
+      SPRING_REDIS_LETTUCE_POOL_MAX_IDLE: 10
+      
+      # Kafka (Event publishing)
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_PRODUCER_ACKS: all
+      SPRING_KAFKA_PRODUCER_RETRIES: 3
+      SPRING_KAFKA_CONSUMER_GROUP_ID: personalization-runtime-smart-line
+      SPRING_KAFKA_CONSUMER_AUTO_OFFSET_RESET: earliest
+      
+      # LLM Gateway (Chat GPT integration)
+      ADAPSTORY_LLM_GATEWAY_URL: http://localhost:8081  # Change to your LLM Gateway URL
+      ADAPSTORY_LLM_GATEWAY_TIMEOUT_MS: 5000
+      
+      # Smart Line Feature
+      ADAPSTORY_SMART_LINE_ENABLED: "true"
+      ADAPSTORY_SMART_LINE_TTL_SECONDS: 1800
+      ADAPSTORY_SMART_LINE_WIDGET_TTL_SECONDS: 300
+      
+      # Logging
+      LOGGING_LEVEL_COM_ADAPSTORY_PERSONALIZATION: DEBUG
+      LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_KAFKA: INFO
+      LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_DATA_REDIS: DEBUG
+      
+      # JVM
+      JAVA_OPTS: "-XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Xmx512m -Xms256m"
+    
+    ports:
+      - "8080:8080"
+    
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    
+    networks:
+      - adapstory-smart-line
+    
+    volumes:
+      - ./logs:/app/logs
+
+  # ─────────────────────────────────────────────────────────
+  # Kafka UI (Optional - for monitoring Kafka topics)
+  # ─────────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: adapstory-kafka-ui-smart-line
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: adapstory
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "8090:8080"
+    networks:
+      - adapstory-smart-line
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  adapstory-smart-line:
+    driver: bridge

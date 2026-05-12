@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Smart Line — Demo</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="canvas" id="canvas">
+      <header class="canvas__header">
+        <div class="brand">
+          <span class="brand__dot"></span>
+          <span class="brand__name">Adapstory</span>
+          <span class="brand__sub">Smart Line demo</span>
+        </div>
+        <div class="canvas__meta" id="meta">
+          <span id="meta-space">📚 Learning</span>
+          <span class="dot"></span>
+          <span id="meta-session">new session</span>
+        </div>
+      </header>
+
+      <section class="bento" id="bento" aria-live="polite">
+        <!-- widgets are rendered here -->
+      </section>
+    </main>
+
+    <!-- Smart Line floating bar -->
+    <div class="smart-line" role="region" aria-label="Smart Line">
+      <div class="smart-line__inner">
+        <nav class="chips" id="chips" aria-label="Student Lifecycle Spaces">
+          <!-- chips are rendered here -->
+        </nav>
+
+        <form class="composer" id="composer" autocomplete="off">
+          <button
+            type="button"
+            class="composer__mic"
+            id="mic"
+            aria-label="Голосовой ввод"
+            title="Голосовой ввод"
+          >
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path
+                d="M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3Z"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+              <path
+                d="M5 11a7 7 0 0 0 14 0M12 18v3"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+          <input
+            class="composer__input"
+            id="prompt"
+            type="text"
+            placeholder="Спросите что-нибудь или нажмите микрофон…"
+            aria-label="Prompt"
+            maxlength="1000"
+          />
+          <button type="submit" class="composer__send" id="send" aria-label="Отправить">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path
+                d="M4 12h16m0 0-6-6m6 6-6 6"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+        </form>
+
+        <div class="hint" id="hint">Нажмите микрофон для голоса. Примеры см. в README.</div>
+      </div>
+    </div>
+
+    <!-- Toast area for voice interim + events -->
+    <div class="toast" id="toast" hidden></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,219 @@
+# BFF Student Gateway — Helm values for universal-service chart
+# Student-facing BFF: proxies student requests to backend bounded contexts
+image:
+  repository: harbor.adapstory.com/adapstory/bff-student
+  name: bff-student
+  tag: 26.04.13-2bdcf6001
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: harbor-registry
+
+replicas: 2
+
+remoteComputeScheduling:
+  enabled: true
+  preferredSites:
+    - home-laptop
+    - cloud
+  weight: 90
+
+terminationGracePeriodSeconds: 35
+
+service:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+
+ingress:
+  enabled: true
+  ingressClassName: traefik
+  hosts:
+    - student-api.dev.adapstory.com
+    - dev.adapstory.com
+    - dev.adapstory.ru
+  paths:
+    - path: /web-api/adapstory/student
+      pathType: Prefix
+  tls: true
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+lifecycle:
+  preStop:
+    exec:
+      command: ["sleep", "5"]
+
+serviceMonitor:
+  enabled: true
+  path: /actuator/prometheus
+  interval: 30s
+
+prometheusRule:
+  enabled: true
+
+livenessProbe:
+  tcpSocket:
+    port: 8080
+  initialDelaySeconds: 20
+  periodSeconds: 15
+  timeoutSeconds: 5
+
+readinessProbe:
+  httpGet:
+    path: /actuator/health/readiness
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+
+startupProbe:
+  tcpSocket:
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 5
+  failureThreshold: 30
+
+extraEnv:
+  # ── JVM tuning: ZGC + tiny heap + virtual threads ──
+  - name: JAVA_TOOL_OPTIONS
+    value: "-XX:+UseZGC -XX:+ZGenerational -Xms128m -Xmx256m -Xss512k -XX:MaxMetaspaceSize=192m -XX:ReservedCodeCacheSize=48m -XX:MaxDirectMemorySize=32m -XX:ActiveProcessorCount=2 -XX:+ExitOnOutOfMemoryError"
+  - name: SPRING_THREADS_VIRTUAL_ENABLED
+    value: "true"
+  - name: SPRING_PROFILES_ACTIVE
+    value: "dev"
+  - name: SERVER_PORT
+    value: "8080"
+  - name: SERVER_MAX_HTTP_REQUEST_HEADER_SIZE
+    value: "32KB"
+  # Trust X-Forwarded-* headers from Traefik/Next.js proxy to generate correct public URLs
+  - name: SERVER_FORWARD_HEADERS_STRATEGY
+    value: "FRAMEWORK"
+  # Explicit OAuth2 redirect URI: avoids relying on header forwarding for URL generation
+  - name: SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_KEYCLOAK_REDIRECT_URI
+    value: "{baseUrl}/web-api/adapstory/student/v1/auth/callback/keycloak"
+  # Downstream BC URLs (in-cluster DNS)
+  # Property path: adapstory.bff-student.downstream.*-url
+  # Env var binding: ADAPSTORY_BFF_STUDENT_DOWNSTREAM_*_URL
+  - name: ADAPSTORY_BFF_STUDENT_DOWNSTREAM_IDENTITY_URL
+    value: "http://dev-identity-service-svc.env-dev.svc.cluster.local:8082"
+  - name: ADAPSTORY_BFF_STUDENT_DOWNSTREAM_CATALOG_URL
+    value: "http://dev-data-model-engine-svc.env-dev.svc.cluster.local:8081"
+  - name: ADAPSTORY_BFF_STUDENT_DOWNSTREAM_CONTENT_URL
+    value: "http://dev-plugin-lifecycle-svc.env-dev.svc.cluster.local:8083"
+  - name: ADAPSTORY_BFF_STUDENT_DOWNSTREAM_PROGRESS_URL
+    value: "http://dev-plugin-gateway-svc.env-dev.svc.cluster.local:8090"
+  - name: ADAPSTORY_BFF_STUDENT_DOWNSTREAM_GAMIFICATION_URL
+    value: "http://dev-plugin-gateway-svc.env-dev.svc.cluster.local:8090"
+  - name: ADAPSTORY_BFF_STUDENT_DOWNSTREAM_ONBOARDING_URL
+    value: "http://dev-multi-tenant-runtime-svc.env-dev.svc.cluster.local:8080"
+  - name: ADAPSTORY_BFF_STUDENT_DOWNSTREAM_PLUGIN_LIFECYCLE_URL
+    value: "http://dev-plugin-lifecycle-svc.env-dev.svc.cluster.local:8083"
+  - name: ADAPSTORY_BFF_STUDENT_DOWNSTREAM_PERSONALIZATION_RUNTIME_URL
+    value: "http://dev-personalization-runtime-svc.env-dev.svc.cluster.local:8081"
+  # Mock mode: enable for BCs that are not yet deployed
+  # Post-login redirect for web (mobile uses deep link from application.yml default)
+  - name: ADAPSTORY_BFF_STUDENT_OAUTH2_WEB_POST_LOGIN_REDIRECT
+    value: "/portal/home"
+  - name: ADAPSTORY_BFF_STUDENT_MOCK_MODE_ENABLED
+    value: "false"
+  - name: ADAPSTORY_BFF_STUDENT_MOCK_MODE_CATALOG
+    value: "false"
+  - name: ADAPSTORY_BFF_STUDENT_MOCK_MODE_CONTENT
+    value: "false"
+  - name: ADAPSTORY_BFF_STUDENT_MOCK_MODE_PERSONALIZATION
+    value: "false"
+  - name: ADAPSTORY_BFF_STUDENT_MOCK_MODE_DEVICES
+    value: "false"
+  - name: ADAPSTORY_BFF_STUDENT_MOCK_MODE_PROGRESS
+    value: "false"
+  - name: ADAPSTORY_BFF_STUDENT_MOCK_MODE_GAMIFICATION
+    value: "false"
+  # CORS — all dev domains (both .com and .ru TLDs)
+  - name: ADAPSTORY_BFF_STUDENT_CORS_ALLOWED_ORIGINS_0
+    value: "https://dev.adapstory.com"
+  - name: ADAPSTORY_BFF_STUDENT_CORS_ALLOWED_ORIGINS_1
+    value: "https://dev.adapstory.ru"
+  # Keycloak OAuth2 — explicit endpoints (no issuer-uri auto-discovery)
+  - name: KEYCLOAK_ISSUER_URI
+    value: "https://auth.dev.adapstory.com/realms/adapstory"
+  - name: KEYCLOAK_AUTHORIZATION_URI
+    value: "https://auth.dev.adapstory.com/realms/adapstory/protocol/openid-connect/auth"
+  - name: KEYCLOAK_TOKEN_URI
+    value: "http://dev-keycloak-svc.env-dev.svc.cluster.local:8080/realms/adapstory/protocol/openid-connect/token"
+  - name: KEYCLOAK_JWK_SET_URI
+    value: "http://dev-keycloak-svc.env-dev.svc.cluster.local:8080/realms/adapstory/protocol/openid-connect/certs"
+  - name: KEYCLOAK_USER_INFO_URI
+    value: "http://dev-keycloak-svc.env-dev.svc.cluster.local:8080/realms/adapstory/protocol/openid-connect/userinfo"
+  - name: KEYCLOAK_CLIENT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: dev-bff-student-keycloak-client
+        key: client-secret
+  # Keycloak JWKS (property: authentication.web-client-oidc.*)
+  - name: AUTHENTICATION_WEB_CLIENT_OIDC_SIGMA_HOST
+    value: "http://dev-keycloak-svc.env-dev.svc.cluster.local:8080/realms/adapstory"
+  - name: AUTHENTICATION_WEB_CLIENT_OIDC_SIGMA_PATH
+    value: "/protocol/openid-connect/certs"
+  - name: AUTHENTICATION_WEB_CLIENT_OIDC_ISSUERS_0
+    value: "https://auth.dev.adapstory.com/realms/adapstory"
+  - name: AUTHENTICATION_WEB_CLIENT_OIDC_AUDIENCES_0
+    value: "adapstory-api"
+  # OTel service name (§6.2 — required for Tempo trace display)
+  # Debug logging for OAuth2 troubleshooting (dev only)
+  - name: LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_SECURITY
+    value: "DEBUG"
+  - name: LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_SECURITY_OAUTH2
+    value: "DEBUG"
+  - name: LOGGING_LEVEL_COM_ADAPSTORY_BFF_STUDENT
+    value: "TRACE"
+  - name: LOGGING_LEVEL_COM_ADAPSTORY
+    value: "TRACE"
+  # [S-4] HTTP stack logging — missing from dev (audit 2026-03-27)
+  - name: LOGGING_LEVEL_ORG_SPRINGFRAMEWORK_CLOUD_GATEWAY
+    value: "DEBUG"
+  - name: LOGGING_LEVEL_REACTOR_NETTY_HTTP_CLIENT
+    value: "DEBUG"
+  - name: LOGGING_LEVEL_ROOT
+    value: "INFO"
+  # Redis for distributed session store (OAuth2 state survives pod restarts)
+  - name: SPRING_DATA_REDIS_HOST
+    value: "redis-dev.env-dev.svc.cluster.local"
+  - name: SPRING_DATA_REDIS_PORT
+    value: "6379"
+  - name: OTEL_SERVICE_NAME
+    value: "adapstory-bff-student"
+  # OTLP Tracing (adapstory.monitoring.tracing.* → adapstory-starter-tracing)
+  - name: ADAPSTORY_MONITORING_TRACING_ENABLED
+    value: "true"
+  - name: ADAPSTORY_MONITORING_TRACING_ENDPOINT
+    value: "http://dev-opentelemetry-collector.env-dev.svc.cluster.local:4317"
+  - name: ADAPSTORY_MONITORING_TRACING_PROTOCOL
+    value: "grpc"
+  # OTLP Metrics (adapstory.monitoring.otlp.* → adapstory-starter-monitoring)
+  - name: ADAPSTORY_MONITORING_OTLP_ENABLED
+    value: "true"
+  - name: ADAPSTORY_MONITORING_OTLP_ENDPOINT
+    value: "http://dev-opentelemetry-collector.env-dev.svc.cluster.local:4318/v1/metrics"
+  - name: ADAPSTORY_MONITORING_OTLP_STEP_SECONDS
+    value: "60"
